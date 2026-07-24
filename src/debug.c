@@ -96,7 +96,13 @@ void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret);
  * Since xor is commutative, this operation is used in order to
  * "add" digests relative to unordered elements.
  *
- * So digest(a,b,c,d) will be the same of digest(b,a,c,d) */
+ * So digest(a,b,c,d) will be the same of digest(b,a,c,d)
+ *
+ * NOTE: the SHA-1 here (and in mixDigest below) is NOT security/auth crypto. It
+ * is a dataset consistency digest for DEBUG DIGEST / DEBUG DIGEST-VALUE, used to
+ * compare datasets in tests and replication checks. It must stay on the bundled
+ * SHA-1 unconditionally and must not be routed through a crypto provider that
+ * may disable SHA-1 (FIPS policy / SHA-1 sunset). */
 void xorDigest(unsigned char *digest, const void *ptr, size_t len) {
     SHA1_CTX ctx;
     unsigned char hash[20];

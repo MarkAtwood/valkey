@@ -119,6 +119,8 @@ void getRandomSeedCString(char *buff, size_t len);
 void setRandomSeedCString(char *seed_str, size_t len);
 void getRandomHexChars(char *p, size_t len);
 void getRandomBytes(unsigned char *p, size_t len);
+/* Writes a fixed 32-byte (SHA256_BLOCK_SIZE) digest; `digest` must be >= 32 bytes. */
+void sha256_digest(unsigned char *digest, const void *data, size_t len);
 long long ustime(void);
 mstime_t mstime(void);
 void writePointerWithPadding(unsigned char *buf, const void *ptr);

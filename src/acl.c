@@ -213,16 +213,17 @@ static int time_independent_strcmp(char *a, char *b, int len) {
 }
 
 /* Given an SDS string, returns the SHA256 hex representation as a
- * new SDS string. */
+ * new SDS string.
+ *
+ * This is the password hash used by AUTH / ACL SETUSER, so it is security/auth
+ * crypto: sha256_digest() routes it through the OpenSSL 3 provider when built
+ * with TLS (USE_OPENSSL == 1), and uses the bundled SHA-256 otherwise. */
 static sds ACLHashPassword(unsigned char *cleartext, size_t len) {
-    SHA256_CTX ctx;
     unsigned char hash[SHA256_BLOCK_SIZE];
     char hex[HASH_PASSWORD_LEN];
     char *cset = "0123456789abcdef";
 
-    sha256_init(&ctx);
-    sha256_update(&ctx, (unsigned char *)cleartext, len);
-    sha256_final(&ctx, hash);
+    sha256_digest(hash, cleartext, len);
 
     for (int j = 0; j < SHA256_BLOCK_SIZE; j++) {
         hex[j * 2] = cset[((hash[j] & 0xF0) >> 4)];

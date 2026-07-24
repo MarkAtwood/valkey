@@ -55,6 +55,18 @@
 #include "valkey_strtod.h"
 #include "monotonic.h"
 
+#if defined(USE_OPENSSL) && USE_OPENSSL == 1 /* BUILD_YES */
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+/* Routing security/auth crypto through a configured provider needs the OpenSSL 3
+ * provider APIs (EVP_MD_fetch) and config-driven provider selection. Older
+ * OpenSSL and LibreSSL have neither, so those builds keep the bundled
+ * implementations; BUILD_TLS=yes alone does not imply OpenSSL 3. */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+#define USE_OPENSSL_PROVIDER_CRYPTO 1
+#endif
+#endif
+
 #if HAVE_X86_SIMD
 #include <immintrin.h>
 #endif
@@ -1052,15 +1064,40 @@ err:
     return 0;
 }
 
+/* One-shot SHA-256 of `data` (`len` bytes) into `digest`, which must point to a
+ * SHA256_BLOCK_SIZE (32) byte buffer.
+ *
+ * When built with TLS against OpenSSL 3 this routes through the provider via a
+ * fetched EVP_MD, so security/auth hashing (ACL password verification, hash-seed
+ * derivation) is serviced by the selected crypto provider (e.g. wolfProvider).
+ * The fetch uses a NULL property query, keeping Valkey provider-agnostic; the
+ * active provider is chosen through openssl.cnf. Otherwise it uses the bundled
+ * SHA-256. A provider failure is fatal: we never silently fall back to a weaker
+ * path for security-sensitive hashing. */
+void sha256_digest(unsigned char *digest, const void *data, size_t len) {
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    EVP_MD *md = EVP_MD_fetch(NULL, "SHA256", NULL);
+    unsigned int digest_len = 0;
+    if (md == NULL) panic("EVP_MD_fetch(SHA256) failed");
+    if (EVP_Digest(data, len, digest, &digest_len, md, NULL) != 1 || digest_len != SHA256_BLOCK_SIZE) {
+        EVP_MD_free(md);
+        panic("EVP_Digest(SHA256) failed");
+    }
+    EVP_MD_free(md);
+#else
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const BYTE *)data, len);
+    sha256_final(&ctx, digest);
+#endif
+}
+
 /* Populate the provided seed array by hashing the provided string with SHA256
  * and copying the first outlen bytes of the digest into the seed buffer. */
 void getHashSeedFromString(unsigned char *seed_array, size_t outlen, const char *value, size_t value_len) {
-    SHA256_CTX ctx;
     unsigned char digest[SHA256_BLOCK_SIZE];
 
-    sha256_init(&ctx);
-    sha256_update(&ctx, (const BYTE *)value, value_len);
-    sha256_final(&ctx, digest);
+    sha256_digest(digest, value, value_len);
 
     if (outlen > SHA256_BLOCK_SIZE) outlen = SHA256_BLOCK_SIZE;
     memcpy(seed_array, digest, outlen);
@@ -1091,6 +1128,8 @@ int version2num(const char *version) {
 
 /* Global state. */
 static int seed_initialized = 0;
+static int seed_explicit = 0;  /* Seed came from setRandomSeedCString(), so the
+                                  caller asked for a reproducible stream. */
 static unsigned char seed[64]; /* 512 bit internal block size. */
 
 static void initializeRandomSeed(void) {
@@ -1123,6 +1162,7 @@ void setRandomSeedCString(char *seed_str, size_t len) {
         sscanf(seed_str + (i * 2), "%02hhX", &seed[i]);
     }
     seed_initialized = 1;
+    seed_explicit = 1;
 }
 
 /* This function populates a char buffer with 129 bytes with the 64 bytes
@@ -1140,12 +1180,36 @@ void getRandomSeedCString(char *buff, size_t len) {
     buff[sizeof(seed) * 2] = '\0';
 }
 
-/* Get random bytes, attempts to get an initial seed from /dev/urandom and
- * the uses a one way hash function in counter mode to generate a random
- * stream. However if /dev/urandom is not available, a weaker seed is used.
- *
- * This function is not thread safe, since the state is global. */
+/* Get random bytes. When built with TLS against OpenSSL 3 this draws from the
+ * RAND provider via RAND_bytes(), which is thread safe. Otherwise it attempts to
+ * get an initial seed from /dev/urandom and then uses a one way hash function in
+ * counter mode to generate a random stream (if /dev/urandom is not available, a
+ * weaker seed is used); that bundled path is NOT thread safe, since the seed
+ * state is global. */
 void getRandomBytes(unsigned char *p, size_t len) {
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    /* Route through the OpenSSL 3 RAND provider (e.g. wolfProvider) so
+     * security-sensitive randomness (ACL GENPASS, the SipHash hash seed,
+     * RM_GetRandomBytes) is served by the selected crypto provider. RAND_bytes
+     * takes an int length, so draw in INT_MAX-sized chunks. A CSPRNG failure is
+     * fatal; we never degrade to the bundled generator behind the caller's back.
+     *
+     * An explicit seed is the one exception: setRandomSeedCString() exists only
+     * to make `make test-unit seed=<n>` reproducible, and tests such as
+     * test_hashtable.cpp take both their PRNG seed and hash seed from here. A
+     * CSPRNG cannot reproduce a seed, so when one was set we fall through to the
+     * bundled deterministic generator. Nothing in the server calls that setter,
+     * so this cannot weaken production randomness. */
+    if (!seed_explicit) {
+        while (len) {
+            int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+            if (RAND_bytes(p, chunk) != 1) panic("RAND_bytes failed");
+            p += chunk;
+            len -= (size_t)chunk;
+        }
+        return;
+    }
+#endif
     static uint64_t counter = 0; /* The counter we hash with the seed. */
 
     if (!seed_initialized) {

@@ -119,6 +119,12 @@ void evalInit(void) {
  * bodies in order to obtain the Lua function name, and in the implementation
  * of server.sha1().
  *
+ * NOTE: this SHA-1 is NOT security/auth crypto. It is the EVALSHA/SCRIPT
+ * protocol identity of a Lua script (a content lookup key). The algorithm is
+ * fixed by the wire protocol and clients pass the digest back, so it must stay
+ * on the bundled SHA-1 unconditionally and must not be routed through a crypto
+ * provider that may disable SHA-1 (FIPS policy / SHA-1 sunset).
+ *
  * 'digest' should point to a 41 bytes buffer: 40 for SHA1 converted into an
  * hexadecimal number, plus 1 byte for null term. */
 void sha1hex(char *digest, char *script, size_t len) {

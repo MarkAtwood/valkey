@@ -1269,6 +1269,12 @@ static int luaRedisPCallCommand(lua_State *lua) {
  * bodies in order to obtain the Lua function name, and in the implementation
  * of server.sha1().
  *
+ * NOTE: this SHA-1 is NOT security/auth crypto. It backs the client-callable
+ * server.sha1hex()/redis.sha1hex() Lua helper and the EVALSHA script identity;
+ * it is a general-purpose content hash, not an authentication primitive. It
+ * must stay on the bundled SHA-1 unconditionally and must not be routed through
+ * a crypto provider that may disable SHA-1 (FIPS policy / SHA-1 sunset).
+ *
  * 'digest' should point to a 41 bytes buffer: 40 for SHA1 converted into an
  * hexadecimal number, plus 1 byte for null term. */
 __attribute__((weak)) void sha1hex(char *digest, char *script, size_t len) {
