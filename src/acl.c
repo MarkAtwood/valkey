@@ -213,16 +213,18 @@ static int time_independent_strcmp(char *a, char *b, int len) {
 }
 
 /* Given an SDS string, returns the SHA256 hex representation as a
- * new SDS string. */
+ * new SDS string, or NULL if the digest could not be computed.
+ *
+ * This is the password hash behind AUTH and ACL SETUSER, so it is security
+ * crypto: digestSHA256() serves it from the configured OpenSSL 3 provider when
+ * built with TLS, and from the bundled SHA-256 otherwise. A provider failure
+ * returns NULL and every caller must fail closed rather than authenticate. */
 static sds ACLHashPassword(unsigned char *cleartext, size_t len) {
-    SHA256_CTX ctx;
     unsigned char hash[SHA256_BLOCK_SIZE];
     char hex[HASH_PASSWORD_LEN];
     char *cset = "0123456789abcdef";
 
-    sha256_init(&ctx);
-    sha256_update(&ctx, (unsigned char *)cleartext, len);
-    sha256_final(&ctx, hash);
+    if (!digestSHA256(hash, cleartext, len)) return NULL;
 
     for (int j = 0; j < SHA256_BLOCK_SIZE; j++) {
         hex[j * 2] = cset[((hash[j] & 0xF0) >> 4)];
@@ -1393,6 +1395,7 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * EBADMSG: The hash you are trying to add is not a valid hash.
  * ECHILD: Attempt to allow a specific first argument of a subcommand
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
+ * EIO: The password could not be hashed because the crypto provider failed.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     /* as we are changing the ACL, the old generated string is now invalid */
@@ -1422,6 +1425,10 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         sds newpass;
         if (op[0] == '>') {
             newpass = ACLHashPassword((unsigned char *)op + 1, oplen - 1);
+            if (newpass == NULL) {
+                errno = EIO;
+                return C_ERR;
+            }
         } else {
             if (ACLCheckPasswordHash((unsigned char *)op + 1, oplen - 1) == C_ERR) {
                 errno = EBADMSG;
@@ -1441,6 +1448,10 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         sds delpass;
         if (op[0] == '<') {
             delpass = ACLHashPassword((unsigned char *)op + 1, oplen - 1);
+            if (delpass == NULL) {
+                errno = EIO;
+                return C_ERR;
+            }
         } else {
             if (ACLCheckPasswordHash((unsigned char *)op + 1, oplen - 1) == C_ERR) {
                 errno = EBADMSG;
@@ -1518,6 +1529,9 @@ const char *ACLSetUserStringError(void) {
     else if (errno == EBADMSG)
         errmsg = "The password hash must be exactly 64 characters and contain "
                  "only lowercase hexadecimal characters";
+    else if (errno == EIO)
+        errmsg = "The password could not be hashed because the crypto provider "
+                 "failed to compute SHA-256";
     else if (errno == EALREADY)
         errmsg = "Duplicate user found. A user can only be defined once in "
                  "config files";
@@ -1555,6 +1569,8 @@ void ACLInit(void) {
  *
  *  EINVAL: if the username-password do not match.
  *  ENOENT: if the specified user does not exist at all.
+ *  EIO: if the crypto provider could not hash the supplied password, so no
+ *       comparison was possible and authentication was denied.
  */
 int ACLCheckUserCredentials(robj *username, robj *password) {
     user *u = ACLGetUserByName(objectGetVal(username), sdslen(objectGetVal(username)));
@@ -1578,6 +1594,21 @@ int ACLCheckUserCredentials(robj *username, robj *password) {
     listNode *ln;
     listRewind(u->passwords, &li);
     sds hashed = ACLHashPassword(objectGetVal(password), sdslen(objectGetVal(password)));
+    if (hashed == NULL) {
+        /* The provider could not hash the supplied password, so no comparison
+         * is possible. Deny rather than fall back to a different digest.
+         *
+         * Log once: this path is reachable by an unauthenticated peer through
+         * AUTH, and the failure is a persistent configuration problem, so
+         * logging per attempt would let a remote client flood the log. */
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            serverLog(LL_WARNING, "Denying authentication: the crypto provider could not compute SHA-256.");
+        }
+        errno = EIO;
+        return C_ERR;
+    }
     while ((ln = listNext(&li))) {
         sds thispass = listNodeValue(ln);
         if (!time_independent_strcmp(hashed, thispass, HASH_PASSWORD_LEN)) {
@@ -2459,11 +2490,15 @@ static int ACLLoadConfiguredUsers(void) {
         /* Load every rule defined for this user. */
         for (int j = 1; aclrules[j]; j++) {
             if (ACLSetUser(u, aclrules[j], sdslen(aclrules[j])) != C_OK) {
+                int saved_errno = errno;
                 const char *errmsg = ACLSetUserStringError();
+                /* A hashing failure is the one error that can reach here for a
+                 * '>' rule, whose argument is a cleartext password. Redact the
+                 * rule rather than write the credential to the log. */
                 serverLog(LL_WARNING,
                           "Error loading ACL rule '%s' for "
                           "the user named '%s': %s",
-                          aclrules[j], aclrules[0], errmsg);
+                          saved_errno == EIO ? "(redacted)" : aclrules[j], aclrules[0], errmsg);
                 return C_ERR;
             }
         }
@@ -3295,7 +3330,10 @@ void aclCommand(client *c) {
         }
 
         long chars = (bits + 3) / 4; /* Round to number of characters to emit. */
-        getRandomHexChars(pass, chars);
+        if (!getSecureRandomHexChars(pass, chars)) {
+            addReplyError(c, "The crypto provider could not supply random bytes");
+            return;
+        }
         addReplyBulkCBuffer(c, pass, chars);
     } else if (!strcasecmp(sub, "log") && (c->argc == 2 || c->argc == 3)) {
         long count = 10; /* Number of entries to emit by default. */
@@ -3493,14 +3531,22 @@ void authCommand(client *c) {
 }
 
 /* Set the password for the "default" ACL user. This implements supports for
- * requirepass config, so passing in NULL will set the user to be nopass. */
-void ACLUpdateDefaultUserPassword(sds password) {
+ * requirepass config, so passing in NULL will set the user to be nopass.
+ *
+ * Returns C_OK, or C_ERR if the password could not be hashed. "resetpass" has
+ * already run by then, so the default user is left with no password at all and
+ * authentication fails closed rather than opening up. The caller must report
+ * that: silently leaving a server nobody can authenticate to is worse than the
+ * original failure. */
+int ACLUpdateDefaultUserPassword(sds password) {
     ACLSetUser(DefaultUser, "resetpass", -1);
     if (password) {
         sds aclop = sdscatlen(sdsnew(">"), password, sdslen(password));
-        ACLSetUser(DefaultUser, aclop, sdslen(aclop));
+        int res = ACLSetUser(DefaultUser, aclop, sdslen(aclop));
         sdsfree(aclop);
+        if (res != C_OK) return C_ERR;
     } else {
         ACLSetUser(DefaultUser, "nopass", -1);
     }
+    return C_OK;
 }
