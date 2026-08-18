@@ -422,4 +422,24 @@ void setcpuaffinity(const char *cpulist);
 #define HAVE_IFUNC 0
 #endif
 
+/* Route security and auth crypto (ACL password hashing, secret random material)
+ * through the crypto provider the operator selected in openssl.cnf. This needs
+ * the OpenSSL 3 provider APIs (EVP_MD_fetch, RAND_priv_bytes) and libcrypto
+ * linked into the server binary itself, so it is enabled only for:
+ *
+ *   BUILD_TLS=yes (USE_OPENSSL == 1), against OpenSSL >= 3.0, not LibreSSL.
+ *
+ * BUILD_TLS=module compiles the server with USE_OPENSSL == 2 but links
+ * $(LIBCRYPTO_LIBS) only into the TLS module, never into the server, so that
+ * build uses the bundled SHA-256 and the bundled random generator exactly like
+ * a build with no TLS at all. Widening this condition breaks the module build
+ * at link time. Builds without this macro get no provider or FIPS guarantee for
+ * password hashing or secret randomness. */
+#if defined(USE_OPENSSL) && USE_OPENSSL == 1 /* BUILD_YES */
+#include <openssl/opensslv.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+#define USE_OPENSSL_PROVIDER_CRYPTO 1
+#endif
+#endif
+
 #endif

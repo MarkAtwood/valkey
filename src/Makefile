@@ -368,6 +368,10 @@ endif
 TLS_MODULE=
 TLS_MODULE_NAME:=valkey-tls$(PROG_SUFFIX).so
 TLS_MODULE_CFLAGS:=$(FINAL_CFLAGS)
+# Note: libcrypto is linked into the TLS module only, never into the server
+# binary, so the server keeps the bundled SHA-256 and random generator here.
+# Provider-backed auth crypto (USE_OPENSSL_PROVIDER_CRYPTO in config.h) is
+# therefore unavailable in this build mode; it needs BUILD_TLS=yes.
 ifeq ($(BUILD_TLS),module)
 	FINAL_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS)
 	TLS_CLIENT_LIBS = ../deps/libvalkey/lib/libvalkey_tls.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)

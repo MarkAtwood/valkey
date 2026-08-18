@@ -212,18 +212,19 @@ static int time_independent_strcmp(char *a, char *b, int len) {
     return diff; /* If zero strings are the same. */
 }
 
-/* Given an SDS string, returns the SHA256 hex representation as a
- * new SDS string.
+/* Given an SDS string, returns the SHA256 hex representation as a new SDS
+ * string, or NULL if the digest failed.
  *
  * This is the password hash used by AUTH / ACL SETUSER, so it is security/auth
- * crypto: sha256_digest() routes it through the OpenSSL 3 provider when built
- * with TLS (USE_OPENSSL == 1), and uses the bundled SHA-256 otherwise. */
+ * crypto: it goes through digestSHA256() in util.c, which may be served by a
+ * crypto provider and may therefore fail. Callers must handle NULL and never
+ * fall back to another hash. */
 static sds ACLHashPassword(unsigned char *cleartext, size_t len) {
     unsigned char hash[SHA256_BLOCK_SIZE];
     char hex[HASH_PASSWORD_LEN];
     char *cset = "0123456789abcdef";
 
-    sha256_digest(hash, cleartext, len);
+    if (!digestSHA256(hash, cleartext, len)) return NULL;
 
     for (int j = 0; j < SHA256_BLOCK_SIZE; j++) {
         hex[j * 2] = cset[((hash[j] & 0xF0) >> 4)];
@@ -1423,6 +1424,10 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         sds newpass;
         if (op[0] == '>') {
             newpass = ACLHashPassword((unsigned char *)op + 1, oplen - 1);
+            if (newpass == NULL) {
+                errno = EIO;
+                return C_ERR;
+            }
         } else {
             if (ACLCheckPasswordHash((unsigned char *)op + 1, oplen - 1) == C_ERR) {
                 errno = EBADMSG;
@@ -1442,6 +1447,10 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         sds delpass;
         if (op[0] == '<') {
             delpass = ACLHashPassword((unsigned char *)op + 1, oplen - 1);
+            if (delpass == NULL) {
+                errno = EIO;
+                return C_ERR;
+            }
         } else {
             if (ACLCheckPasswordHash((unsigned char *)op + 1, oplen - 1) == C_ERR) {
                 errno = EBADMSG;
@@ -1526,6 +1535,9 @@ const char *ACLSetUserStringError(void) {
         errmsg = "Allowing first-arg of a subcommand is not supported";
     else if (errno == ERANGE)
         errmsg = "The provided database ID is out of range";
+    else if (errno == EIO)
+        errmsg = "Hashing the password failed. Check the crypto provider "
+                 "selected in openssl.cnf";
     return errmsg;
 }
 
@@ -1579,6 +1591,10 @@ int ACLCheckUserCredentials(robj *username, robj *password) {
     listNode *ln;
     listRewind(u->passwords, &li);
     sds hashed = ACLHashPassword(objectGetVal(password), sdslen(objectGetVal(password)));
+    if (hashed == NULL) {
+        errno = EIO;
+        return C_ERR;
+    }
     while ((ln = listNext(&li))) {
         sds thispass = listNodeValue(ln);
         if (!time_independent_strcmp(hashed, thispass, HASH_PASSWORD_LEN)) {
@@ -1613,8 +1629,11 @@ void addAuthErrReply(client *c, robj *err) {
  * are correct, the connection is put in authenticated state and the
  * connection user reference is populated.
  *
- * The return value is AUTH_OK on success (valid username / password pair) & AUTH_ERR otherwise. */
-static int checkPasswordBasedAuth(client *c, robj *username, robj *password) {
+ * The return value is AUTH_OK on success (valid username / password pair) & AUTH_ERR otherwise.
+ * If hashing the password failed, `*err` is set to the error to report to the
+ * client: that is a server side failure, not a rejected credential, and it must
+ * not take the server down since AUTH is reachable unauthenticated. */
+static int checkPasswordBasedAuth(client *c, robj *username, robj *password, robj **err) {
     int result;
 
     if (ACLCheckUserCredentials(username, password) == C_OK) {
@@ -1622,6 +1641,10 @@ static int checkPasswordBasedAuth(client *c, robj *username, robj *password) {
         clientSetUser(c, user, 1);
         moduleNotifyUserChanged(c);
         result = AUTH_OK;
+    } else if (errno == EIO) {
+        const char *msg = "-ERR hashing the password failed, check the crypto provider selected in openssl.cnf";
+        *err = createStringObject(msg, strlen(msg));
+        return AUTH_ERR;
     } else {
         addACLLogEntry(c, ACL_DENIED_AUTH, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, 0, objectGetVal(username),
                        NULL);
@@ -1647,7 +1670,7 @@ int ACLAuthenticateUser(client *c, robj *username, robj *password, robj **err) {
     int result = checkModuleAuthentication(c, username, password, err);
     /* If authentication was not handled by any Module, attempt normal password based auth. */
     if (result == AUTH_NOT_HANDLED) {
-        result = checkPasswordBasedAuth(c, username, password);
+        result = checkPasswordBasedAuth(c, username, password, err);
     }
     return result;
 }
@@ -3296,7 +3319,14 @@ void aclCommand(client *c) {
         }
 
         long chars = (bits + 3) / 4; /* Round to number of characters to emit. */
-        getRandomHexChars(pass, chars);
+        if (!getSecureRandomHexChars(pass, chars)) {
+            /* Fail closed: never emit a password from a weaker generator. This
+             * must stay an error reply, not a panic: GENPASS is a client
+             * command and a provider failure must not take the server down. */
+            addReplyError(c, "Failed to generate a password: the CSPRNG returned an error. "
+                             "Check the crypto provider selected in openssl.cnf and its DRBG");
+            return;
+        }
         addReplyBulkCBuffer(c, pass, chars);
     } else if (!strcasecmp(sub, "log") && (c->argc == 2 || c->argc == 3)) {
         long count = 10; /* Number of entries to emit by default. */

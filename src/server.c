@@ -7530,7 +7530,19 @@ __attribute__((weak)) int main(int argc, char **argv) {
     umask(server.umask = umask(0777));
 
     uint8_t hashseed[16];
-    getRandomBytes(hashseed, sizeof(hashseed));
+    if (!getSecureRandomBytes(hashseed, sizeof(hashseed))) {
+        /* This runs before initServerConfig(), so serverLog() and panic() are
+         * unusable here: server.logfile is still NULL and serverLogRaw() would
+         * dereference it, crashing with no diagnostic at all. Report on stderr
+         * and refuse to start. */
+        fprintf(stderr, "FATAL: the CSPRNG failed to supply the hash table seed.\n"
+                        "Check the crypto provider selected in openssl.cnf and its DRBG: a provider "
+                        "that fails its self test, or that supplies no DRBG, makes RAND_priv_bytes() "
+                        "fail here on the very first call.\n"
+                        "Refusing to start rather than seed the hash function from a non-CSPRNG.\n");
+        fflush(stderr);
+        exit(1);
+    }
     hashtableSetHashFunctionSeed(hashseed);
 
     char *exec_name = strrchr(argv[0], '/');
@@ -7692,7 +7704,11 @@ __attribute__((weak)) int main(int argc, char **argv) {
      * hashes) or use the random seed if not configured. */
     if (server.hash_seed) {
         uint8_t seed[16] = {0};
-        getHashSeedFromString(seed, sizeof(seed), server.hash_seed, sdslen(server.hash_seed));
+        if (!getHashSeedFromString(seed, sizeof(seed), server.hash_seed, sdslen(server.hash_seed))) {
+            serverLog(LL_WARNING, "Failed to derive the configured hash seed: the SHA-256 digest returned "
+                                  "an error. Check the crypto provider selected in openssl.cnf. Exiting.");
+            exit(1);
+        }
         setConfigurableHashSeed(seed);
     } else {
         setConfigurableHashSeed(hashtableGetHashFunctionSeed());
@@ -7783,6 +7799,16 @@ __attribute__((weak)) int main(int argc, char **argv) {
     server.lua_insecure_api_current = server.lua_enable_insecure_api;
 
     InitServerLast();
+
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    serverLog(LL_NOTICE, "Provider-backed crypto enabled: ACL password hashing and secret random material "
+                         "are served by the crypto provider selected in openssl.cnf.");
+#else
+    serverLog(LL_NOTICE, "Provider-backed crypto disabled: ACL password hashing and secret random material "
+                         "use the bundled implementations, with no provider or FIPS guarantee. It requires a "
+                         "BUILD_TLS=yes build against OpenSSL 3.0 or later (not LibreSSL); BUILD_TLS=module "
+                         "does not link libcrypto into the server itself.");
+#endif
 
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */

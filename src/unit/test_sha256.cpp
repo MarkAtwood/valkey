@@ -22,20 +22,18 @@
 
 extern "C" {
 #include "sha256.h"
-/* One-shot helper from util.c; routes through the provider when built with TLS
- * against OpenSSL 3, bundled SHA-256 otherwise. */
-void sha256_digest(unsigned char *digest, const void *data, size_t len);
+#include "util.h"
 }
 
 #define BUFSIZE 4096
 
 class Sha256Test : public ::testing::Test {};
 
-/* Verify the sha256_digest() one-shot helper against the NIST "abc" known-answer
+/* Verify the digestSHA256() one-shot helper against the NIST "abc" known-answer
  * vector. Exercises the provider path when built with TLS against OpenSSL 3 and
  * the bundled path otherwise; the expected digest is an external NIST oracle,
  * independent of the code under test. */
-TEST_F(Sha256Test, TestSha256DigestHelperAbc) {
+TEST_F(Sha256Test, TestDigestSHA256HelperAbc) {
     BYTE hash[32];
     BYTE expected[32] = {
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
@@ -43,7 +41,7 @@ TEST_F(Sha256Test, TestSha256DigestHelperAbc) {
         0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
         0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
 
-    sha256_digest(hash, "abc", 3);
+    ASSERT_EQ(digestSHA256(hash, "abc", 3), 1);
 
     ASSERT_EQ(memcmp(hash, expected, 32), 0);
 }

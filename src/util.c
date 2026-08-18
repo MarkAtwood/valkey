@@ -46,6 +46,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <pthread.h>
 
 #include "util.h"
 #include "sha256.h"
@@ -55,16 +56,11 @@
 #include "valkey_strtod.h"
 #include "monotonic.h"
 
-#if defined(USE_OPENSSL) && USE_OPENSSL == 1 /* BUILD_YES */
+/* USE_OPENSSL_PROVIDER_CRYPTO is derived in config.h; see the comment there for
+ * exactly which builds get provider-backed crypto and why. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-/* Routing security/auth crypto through a configured provider needs the OpenSSL 3
- * provider APIs (EVP_MD_fetch) and config-driven provider selection. Older
- * OpenSSL and LibreSSL have neither, so those builds keep the bundled
- * implementations; BUILD_TLS=yes alone does not imply OpenSSL 3. */
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-#define USE_OPENSSL_PROVIDER_CRYPTO 1
-#endif
 #endif
 
 #if HAVE_X86_SIMD
@@ -1064,43 +1060,64 @@ err:
     return 0;
 }
 
-/* One-shot SHA-256 of `data` (`len` bytes) into `digest`, which must point to a
- * SHA256_BLOCK_SIZE (32) byte buffer.
- *
- * When built with TLS against OpenSSL 3 this routes through the provider via a
- * fetched EVP_MD, so security/auth hashing (ACL password verification, hash-seed
- * derivation) is serviced by the selected crypto provider (e.g. wolfProvider).
- * The fetch uses a NULL property query, keeping Valkey provider-agnostic; the
- * active provider is chosen through openssl.cnf. Otherwise it uses the bundled
- * SHA-256. A provider failure is fatal: we never silently fall back to a weaker
- * path for security-sensitive hashing. */
-void sha256_digest(unsigned char *digest, const void *data, size_t len) {
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
-    EVP_MD *md = EVP_MD_fetch(NULL, "SHA256", NULL);
+/* The SHA-256 implementation is bound at first use: the EVP_MD is fetched once
+ * and reused for the lifetime of the process, and is never freed. Explicit
+ * fetching is a provider method-store lookup plus a property-query parse, which
+ * for a short input costs more than the digest itself, and digestSHA256() is on
+ * the AUTH path. A provider swapped in after the first digest is not picked up.
+ *
+ * The NULL property query keeps Valkey provider-agnostic; openssl.cnf selects
+ * the active provider. If the fetch fails the pointer stays NULL and every
+ * digest reports failure, rather than falling back to the bundled code. */
+static EVP_MD *sha256_md = NULL;
+static pthread_once_t sha256_md_once = PTHREAD_ONCE_INIT;
+
+static void fetchSHA256MD(void) {
+    sha256_md = EVP_MD_fetch(NULL, "SHA256", NULL);
+}
+#endif
+
+/* One-shot SHA-256 of `data` (`len` bytes) into `digest`, which must point to a
+ * SHA256_BLOCK_SIZE (32) byte buffer. Returns 1 on success and 0 on failure; on
+ * failure the contents of `digest` are undefined and must not be used.
+ *
+ * With provider-backed crypto (see USE_OPENSSL_PROVIDER_CRYPTO in config.h:
+ * BUILD_TLS=yes against OpenSSL >= 3.0, not LibreSSL) this routes through the
+ * provider the operator selected in openssl.cnf, so security/auth hashing (ACL
+ * password verification, hash-seed derivation) is serviced by that provider.
+ * BUILD_TLS=module and builds without TLS use the bundled SHA-256, which cannot
+ * fail. A provider failure is never papered over with the bundled path: callers
+ * must propagate the failure. */
+int digestSHA256(unsigned char *digest, const void *data, size_t len) {
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
     unsigned int digest_len = 0;
-    if (md == NULL) panic("EVP_MD_fetch(SHA256) failed");
-    if (EVP_Digest(data, len, digest, &digest_len, md, NULL) != 1 || digest_len != SHA256_BLOCK_SIZE) {
-        EVP_MD_free(md);
-        panic("EVP_Digest(SHA256) failed");
-    }
-    EVP_MD_free(md);
+
+    pthread_once(&sha256_md_once, fetchSHA256MD);
+    if (sha256_md == NULL) return 0;
+    if (EVP_Digest(data, len, digest, &digest_len, sha256_md, NULL) != 1) return 0;
+    if (digest_len != SHA256_BLOCK_SIZE) return 0;
 #else
     SHA256_CTX ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, (const BYTE *)data, len);
     sha256_final(&ctx, digest);
 #endif
+    return 1;
 }
 
 /* Populate the provided seed array by hashing the provided string with SHA256
- * and copying the first outlen bytes of the digest into the seed buffer. */
-void getHashSeedFromString(unsigned char *seed_array, size_t outlen, const char *value, size_t value_len) {
+ * and copying the first outlen bytes of the digest into the seed buffer.
+ * Returns 1 on success, 0 if the digest failed; on failure the seed array is
+ * left untouched. */
+int getHashSeedFromString(unsigned char *seed_array, size_t outlen, const char *value, size_t value_len) {
     unsigned char digest[SHA256_BLOCK_SIZE];
 
-    sha256_digest(digest, value, value_len);
+    if (!digestSHA256(digest, value, value_len)) return 0;
 
     if (outlen > SHA256_BLOCK_SIZE) outlen = SHA256_BLOCK_SIZE;
     memcpy(seed_array, digest, outlen);
+    return 1;
 }
 
 /* Parses a version string on the form "major.minor.patch" and returns an
@@ -1126,12 +1143,23 @@ int version2num(const char *version) {
     return v;
 }
 
-/* Global state. */
+/* Global state of the bundled random generator.
+ *
+ * ponytail: one global mutex serialises the whole bundled generator
+ * (seed_initialized, seed, seed_from_urandom and the counter in
+ * getRandomBytes()). The ceiling is that every thread drawing bytes contends on
+ * one lock; the upgrade path, if that ever shows up in a profile, is a
+ * per-thread generator state seeded from the global one. */
+static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
-static int seed_explicit = 0;  /* Seed came from setRandomSeedCString(), so the
-                                  caller asked for a reproducible stream. */
+/* Set only when the 64 byte seed was actually read from /dev/urandom. The
+ * fallback derivation below is worth roughly the low bits of a microsecond
+ * clock plus a partly known pid, so getSecureRandomBytes() refuses to hand out
+ * secret material derived from it. */
+static int seed_from_urandom = 0;
 static unsigned char seed[64]; /* 512 bit internal block size. */
 
+/* Call with random_mutex held, or before any other thread exists. */
 static void initializeRandomSeed(void) {
     assert(seed_initialized == 0);
     /* Initialize a seed and use SHA1 in counter mode, where we hash
@@ -1150,19 +1178,22 @@ static void initializeRandomSeed(void) {
         }
     } else {
         seed_initialized = 1;
+        seed_from_urandom = 1;
     }
     if (fp) fclose(fp);
 }
 
 /* This function receives a string with 64 bytes encoded as 128 hexadecimal
- * digits, and sets the 64 byte random seed. */
+ * digits, and sets the 64 byte random seed. It exists so that `make test-unit
+ * seed=<n>` reproduces a run, so it deliberately leaves seed_from_urandom
+ * clear: a caller-supplied seed is reproducible, hence not usable for secret
+ * material. Nothing in the server calls it. */
 void setRandomSeedCString(char *seed_str, size_t len) {
     assert(len == sizeof(seed) * 2);
     for (size_t i = 0; i < sizeof(seed); i++) {
         sscanf(seed_str + (i * 2), "%02hhX", &seed[i]);
     }
     seed_initialized = 1;
-    seed_explicit = 1;
 }
 
 /* This function populates a char buffer with 129 bytes with the 64 bytes
@@ -1180,38 +1211,23 @@ void getRandomSeedCString(char *buff, size_t len) {
     buff[sizeof(seed) * 2] = '\0';
 }
 
-/* Get random bytes. When built with TLS against OpenSSL 3 this draws from the
- * RAND provider via RAND_bytes(), which is thread safe. Otherwise it attempts to
- * get an initial seed from /dev/urandom and then uses a one way hash function in
- * counter mode to generate a random stream (if /dev/urandom is not available, a
- * weaker seed is used); that bundled path is NOT thread safe, since the seed
- * state is global. */
+/* Get random bytes, attempts to get an initial seed from /dev/urandom and
+ * the uses a one way hash function in counter mode to generate a random
+ * stream. However if /dev/urandom is not available, a weaker seed is used.
+ *
+ * The generator state (seed and counter) is global and is serialised with
+ * random_mutex, so concurrent callers get distinct output.
+ *
+ * This is the non-security entry point. Direct callers are the module API
+ * (ValkeyModule_GetRandomBytes, so arbitrary module code) and the hashtable
+ * unit test; the rest of the tree reaches it through getRandomHexChars() for
+ * the run id, the replication id, cluster node names and shard ids, the
+ * sentinel id, the RDB EOF mark and migrate slot job names. Secret material
+ * must use getSecureRandomBytes() below instead. */
 void getRandomBytes(unsigned char *p, size_t len) {
-#ifdef USE_OPENSSL_PROVIDER_CRYPTO
-    /* Route through the OpenSSL 3 RAND provider (e.g. wolfProvider) so
-     * security-sensitive randomness (ACL GENPASS, the SipHash hash seed,
-     * RM_GetRandomBytes) is served by the selected crypto provider. RAND_bytes
-     * takes an int length, so draw in INT_MAX-sized chunks. A CSPRNG failure is
-     * fatal; we never degrade to the bundled generator behind the caller's back.
-     *
-     * An explicit seed is the one exception: setRandomSeedCString() exists only
-     * to make `make test-unit seed=<n>` reproducible, and tests such as
-     * test_hashtable.cpp take both their PRNG seed and hash seed from here. A
-     * CSPRNG cannot reproduce a seed, so when one was set we fall through to the
-     * bundled deterministic generator. Nothing in the server calls that setter,
-     * so this cannot weaken production randomness. */
-    if (!seed_explicit) {
-        while (len) {
-            int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
-            if (RAND_bytes(p, chunk) != 1) panic("RAND_bytes failed");
-            p += chunk;
-            len -= (size_t)chunk;
-        }
-        return;
-    }
-#endif
     static uint64_t counter = 0; /* The counter we hash with the seed. */
 
+    pthread_mutex_lock(&random_mutex);
     if (!seed_initialized) {
         initializeRandomSeed();
     }
@@ -1250,18 +1266,77 @@ void getRandomBytes(unsigned char *p, size_t len) {
         len -= copylen;
         p += copylen;
     }
+    pthread_mutex_unlock(&random_mutex);
 }
 
-/* Generate the server "Run ID", a SHA1-sized random number that identifies a
- * given execution of the server, so that if you are talking with an instance
- * having run_id == A, and you reconnect and it has run_id == B, you can be
- * sure that it is either a different instance or it was restarted. */
+/* Hex-charset form of getRandomBytes(): the same non-security entry point,
+ * restricted to [0-9a-f]. Used for the server run id, the replication id,
+ * cluster node names and shard ids, the sentinel id, the RDB EOF mark, migrate
+ * slot job names and ValkeyModule_GetRandomHexChars(). Only 4 bits of entropy
+ * per byte written. Secret material must use getSecureRandomHexChars(). */
 void getRandomHexChars(char *p, size_t len) {
     char *charset = "0123456789abcdef";
     size_t j;
 
     getRandomBytes((unsigned char *)p, len);
     for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
+}
+
+/* Get random bytes for secret material: the ACL GENPASS output, the hash
+ * function seed and ValkeyModule_GetSecureRandomBytes(), which module code may
+ * call for anything it treats as secret. Returns 1 on success and 0 on failure;
+ * on failure the contents of `p` are undefined and must not be used.
+ *
+ * With provider-backed crypto (see USE_OPENSSL_PROVIDER_CRYPTO in config.h) the
+ * bytes come from the RAND provider the operator selected in openssl.cnf, via
+ * RAND_priv_bytes(). The private DRBG is the right call here because the output
+ * is never exposed as a public value. RAND_priv_bytes() takes an int length, so
+ * draw in INT_MAX sized chunks.
+ *
+ * Other builds fall back to the bundled getRandomBytes(), which is a SHA-256
+ * counter mode stream over a 64 byte seed. That is only as good as the seed, so
+ * the fallback is refused unless the seed really came from /dev/urandom: when
+ * the open or read fails (an fd-exhausted process, a container with a
+ * restricted /dev, a seccomp filter), the seed degrades to the low bits of a
+ * microsecond clock and the pid, which is worth a few tens of bits, not the 512
+ * the buffer implies. Returning 0 there is the fail-closed answer; the caller
+ * reports the failure. Off the provider path there is no provider or FIPS
+ * guarantee of any kind.
+ *
+ * A failure is never papered over by falling back to a weaker generator. */
+int getSecureRandomBytes(unsigned char *p, size_t len) {
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    while (len) {
+        int chunk = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+        if (RAND_priv_bytes(p, chunk) != 1) return 0;
+        p += chunk;
+        len -= (size_t)chunk;
+    }
+    return 1;
+#else
+    pthread_mutex_lock(&random_mutex);
+    if (!seed_initialized) initializeRandomSeed();
+    int usable = seed_from_urandom;
+    pthread_mutex_unlock(&random_mutex);
+
+    if (!usable) return 0;
+    getRandomBytes(p, len);
+    return 1;
+#endif
+}
+
+/* Like getSecureRandomBytes() but the output is restricted to the hex charset
+ * [0-9a-f]. As with getRandomHexChars() that is 4 bits of entropy per byte
+ * written, so callers size the buffer for the strength they want; ACL GENPASS
+ * already does this. Returns 1 on success and 0 on failure; on failure the
+ * contents of `p` are undefined and must not be used. */
+int getSecureRandomHexChars(char *p, size_t len) {
+    char *charset = "0123456789abcdef";
+    size_t j;
+
+    if (!getSecureRandomBytes((unsigned char *)p, len)) return 0;
+    for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
+    return 1;
 }
 
 /* Given the filename, return the absolute path as an SDS string, or NULL

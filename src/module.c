@@ -11349,6 +11349,37 @@ void VM_GetRandomHexChars(char *dst, size_t len) {
     getRandomHexChars(dst, len);
 }
 
+/* Return cryptographically secure random bytes, for secret material such as
+ * keys, tokens and nonces. Use this rather than ValkeyModule_GetRandomBytes(),
+ * which is a fast non-cryptographic generator meant for identifiers such as run
+ * ids.
+ *
+ * Returns VALKEYMODULE_OK on success. On failure it returns VALKEYMODULE_ERR
+ * and the contents of `dst` are undefined and must not be used: the call never
+ * falls back to a weaker generator behind the caller's back.
+ *
+ * When the server is built with TLS support compiled in (BUILD_TLS=yes) against
+ * OpenSSL 3.0 or later, the bytes are drawn from the crypto provider the
+ * operator selected in openssl.cnf, so a module generating secret material
+ * stays inside that provider. A server built with TLS as a module
+ * (BUILD_TLS=module), without TLS at all, or against OpenSSL below 3.0 or
+ * LibreSSL, uses the bundled generator instead, with no provider or FIPS
+ * guarantee; that generator is seeded from /dev/urandom and the call fails if
+ * that seed was not available. Both paths are safe to call from any thread. */
+int VM_GetSecureRandomBytes(unsigned char *dst, size_t len) {
+    return getSecureRandomBytes(dst, len) ? VALKEYMODULE_OK : VALKEYMODULE_ERR;
+}
+
+/* Like ValkeyModule_GetSecureRandomBytes() but the string is set to random
+ * characters in the hex charset [0-9a-f]. That is 4 bits of entropy per byte
+ * written, so size the buffer for the strength you need.
+ *
+ * Returns VALKEYMODULE_OK on success, VALKEYMODULE_ERR on failure, in which
+ * case the contents of `dst` are undefined and must not be used. */
+int VM_GetSecureRandomHexChars(char *dst, size_t len) {
+    return getSecureRandomHexChars(dst, len) ? VALKEYMODULE_OK : VALKEYMODULE_ERR;
+}
+
 /* --------------------------------------------------------------------------
  * ## Modules API exporting / importing
  * -------------------------------------------------------------------------- */
@@ -15402,6 +15433,8 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetClusterSize);
     REGISTER_API(GetRandomBytes);
     REGISTER_API(GetRandomHexChars);
+    REGISTER_API(GetSecureRandomBytes);
+    REGISTER_API(GetSecureRandomHexChars);
     REGISTER_API(BlockedClientDisconnected);
     REGISTER_API(SetDisconnectCallback);
     REGISTER_API(GetBlockedClientHandle);
