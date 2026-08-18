@@ -1535,10 +1535,12 @@ int rdbSaveRioWithEOFMark(int req, int rdbver, rio *rdb, int *error, rdbSaveInfo
     char eofmark[RDB_EOF_MARK_SIZE];
 
     startSaving(RDBFLAGS_REPLICATION);
-    /* The mark goes out on the replication link, so it is a public value. When
-     * this runs in the diskless child it is drawn after the child's post-fork
-     * reseed (see the atfork handlers in util.c), so it is not a position of
-     * the parent's stream. */
+    /* The mark is published on the replication link, but only once the prefix
+     * is written: until then it must be unpredictable, because a client that
+     * can guess it can plant a copy inside a value and truncate this stream at
+     * the planted copy. When this runs in the diskless child it is drawn after
+     * the child's post-fork re-key (see the atfork handlers in util.c), so it
+     * is not a position of the parent's stream either. */
     getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
     if (error) *error = 0;
     if (rioWrite(rdb, "$EOF:", 5) == 0) goto werr;

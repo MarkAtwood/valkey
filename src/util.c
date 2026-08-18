@@ -1383,13 +1383,21 @@ void getRandomSeedCString(char *buff, size_t len) {
  * The generator state (seed and counter) is global and is serialised with
  * random_mutex, so concurrent callers get distinct output.
  *
- * This is the non-security entry point: what reaches it, directly or through
- * getRandomHexChars(), wants values that do not collide rather than values that
- * cannot be guessed - the run id, the replication id, cluster node names and
- * shard ids, the sentinel id, the RDB EOF mark, migrate slot job names, the
- * hashtable unit test, and ValkeyModule_GetRandomBytes(), so arbitrary module
- * code. Secret material must use getSecureRandomBytes() below, which is itself
- * the one caller here that draws secrets: in builds without provider crypto it
+ * This is the non-security entry point: most of what reaches it, directly or
+ * through getRandomHexChars(), wants values that do not collide rather than
+ * values that cannot be guessed - the run id, the replication id, cluster node
+ * names and shard ids, the sentinel id, migrate slot job names, the hashtable
+ * unit test, and ValkeyModule_GetRandomBytes(), so arbitrary module code.
+ *
+ * The RDB EOF mark is the exception on this path and must be unpredictable
+ * until it is sent: a mark a client can guess can be planted inside a value by
+ * anyone with write access, truncating the diskless replication stream at the
+ * planted copy. The counter mode stream over the /dev/urandom seed supplies
+ * that, and randomAtforkChild() preserves it across the fork that draws the
+ * mark by re-keying rather than reseeding.
+ *
+ * Secret material must use getSecureRandomBytes() below, which is itself the
+ * one caller here that draws secrets: in builds without provider crypto it
  * falls back to this generator, and gates that fallback on the seed having come
  * from /dev/urandom. */
 void getRandomBytes(unsigned char *p, size_t len) {
@@ -1417,9 +1425,11 @@ void getRandomBytes(unsigned char *p, size_t len) {
 
 /* Hex-charset form of getRandomBytes(): the same non-security entry point,
  * restricted to [0-9a-f]. Used for the server run id, the replication id,
- * cluster node names and shard ids, the sentinel id, the RDB EOF mark, migrate
- * slot job names and ValkeyModule_GetRandomHexChars(). Only 4 bits of entropy
- * per byte written. Secret material must use getSecureRandomHexChars(). */
+ * cluster node names and shard ids, the sentinel id, migrate slot job names,
+ * the RDB EOF mark (the one caller that needs unpredictability, see
+ * getRandomBytes() above and randomAtforkChild()) and
+ * ValkeyModule_GetRandomHexChars(). Only 4 bits of entropy per byte written.
+ * Secret material must use getSecureRandomHexChars(). */
 void getRandomHexChars(char *p, size_t len) {
     char *charset = "0123456789abcdef";
     size_t j;
