@@ -1084,7 +1084,9 @@ static pthread_once_t sha256_md_once = PTHREAD_ONCE_INIT;
  * the queue entry is long gone, and it may have been queued on another thread
  * entirely. This buffer is written only inside pthread_once(), so there is
  * exactly one writer ever, and pthread_once() gives the happens-before edge for
- * every later reader. Empty means no fetch failure was recorded. */
+ * every later reader. Both readers, digestSHA256() and getCryptoFailureReason(),
+ * run the once-init themselves before touching it, which is what supplies that
+ * edge. Empty means no fetch failure was recorded. */
 static char sha256_fetch_error[256];
 
 static void fetchSHA256MD(void) {
@@ -1512,6 +1514,13 @@ int getSecureRandomHexChars(char *p, size_t len) {
 void getCryptoFailureReason(char *buf, size_t buflen) {
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
     unsigned long e, last = 0;
+
+    /* Run the SHA-256 once-init before reading anything it writes: it is what
+     * gives this thread the happens-before edge to sha256_md and
+     * sha256_fetch_error, and it also makes a fetch failure reportable when no
+     * digest has been attempted yet. Doing it before the drain below means a
+     * fetch that fails right here leaves the entry this call reports. */
+    pthread_once(&sha256_md_once, fetchSHA256MD);
 
     /* Drain the whole queue and format the LAST entry, not the first: entries
      * come out oldest first and the queue can still hold unrelated leftovers
