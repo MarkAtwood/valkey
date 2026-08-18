@@ -1574,14 +1574,23 @@ const char *ACLSetUserStringError(void) {
  * per request and fill the disk. At most one line per second is emitted.
  *
  * Nothing untrusted or secret may be passed in here: no password, no password
- * hash and no client supplied user name. */
+ * hash and no client supplied user name.
+ *
+ * errno is preserved across this call, so callers may keep testing it after
+ * logging. */
 static void ACLLogCryptoFailure(const char *context, const char *hint) {
     static mstime_t last_log = 0;
+    /* Callers test errno after this returns: ACLSetUser() reports its failure
+     * kind through errno, and neither mstime() nor serverLog() is documented
+     * to preserve it. */
+    int saved_errno = errno;
     mstime_t now = mstime();
 
-    if (last_log != 0 && now - last_log < 1000) return;
-    last_log = now;
-    serverLog(LL_WARNING, "%s failed. %s", context, hint);
+    if (last_log == 0 || now - last_log >= 1000) {
+        last_log = now;
+        serverLog(LL_WARNING, "%s failed. %s", context, hint);
+    }
+    errno = saved_errno;
 }
 
 /* Create the default user, this has special permissions. */
