@@ -30,6 +30,23 @@ extern char *seed;
 
 class UtilTest : public ::testing::Test {};
 
+/* Weak reference to libcrypto's RAND_priv_bytes(): it resolves to null when
+ * libcrypto is not linked into this binary, and needs neither the OpenSSL
+ * headers nor config.h (the unit test build is not passed -DUSE_OPENSSL, so it
+ * cannot see USE_OPENSSL_PROVIDER_CRYPTO at all).
+ *
+ * config.h documents that provider-backed crypto requires libcrypto linked
+ * into the server binary itself, which only BUILD_TLS=yes does; BUILD_TLS=module
+ * links it into the TLS module only. So a missing symbol proves the secure
+ * random helpers are the bundled ones. Only that direction is used below: a
+ * present symbol does not prove the macro is defined, since an OpenSSL 1.1 or
+ * LibreSSL build links libcrypto and still gets the bundled helpers. */
+extern "C" int RAND_priv_bytes(unsigned char *buf, int num) __attribute__((weak));
+
+static bool bundledCryptoOnly(void) {
+    return RAND_priv_bytes == nullptr;
+}
+
 TEST_F(UtilTest, TestString2ll) {
     char buf[32];
     long long v;
@@ -354,22 +371,51 @@ TEST_F(UtilTest, TestWritePointerWithPadding) {
 
 /* getSecureRandomHexChars() must emit only [0-9a-f] and must not write past
  * len. The charset is the documented contract, so it is an oracle independent
- * of whichever generator backs the call (provider RAND or the bundled one). */
+ * of whichever generator backs the call (provider RAND or the bundled one).
+ *
+ * The other half of that contract, "returns 0 on failure and the caller fails
+ * closed", is reachable without any build-mode knowledge: under `make
+ * test-unit seed=<n>` setRandomSeedCString() clears the flag that marks the
+ * seed as CSPRNG-derived, so a bundled build must refuse to hand out secret
+ * material derived
+ * from a reproducible seed, while a provider build draws from RAND_priv_bytes()
+ * which that seed never reaches and still succeeds. So the test probes the
+ * return value once and asserts whichever half applies, and pins the answer
+ * where it is knowable: success outside seed mode, refusal in seed mode
+ * whenever bundledCryptoOnly() shows there is no provider to draw from. */
 TEST_F(UtilTest, TestSecureRandomHexCharsCharset) {
-    /* A caller-supplied reproducible seed is by construction not usable for
-     * secret material, so the secure random helpers fail closed in that mode
-     * and these tests cannot run. The skip is unconditional, and therefore
-     * conservative in BUILD_TLS=yes builds where the provider path ignores the
-     * seed entirely, rather than pulling config.h into the unit test. */
-    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
-                                         "for secret material, so the secure random helpers fail closed";
-
     char buf[128];
     const size_t len = sizeof(buf) - 1;
 
     memset(buf, '#', sizeof(buf)); /* '#' is outside the charset, so any byte
                                     * left as '#' below was never written. */
-    ASSERT_EQ(getSecureRandomHexChars(buf, len), 1);
+    int usable = getSecureRandomHexChars(buf, len);
+    ASSERT_EQ(buf[len], '#') << "wrote past len";
+    if (seed == nullptr) {
+        ASSERT_EQ(usable, 1) << "no reproducible seed was supplied, so the draw must succeed";
+    } else if (bundledCryptoOnly()) {
+        ASSERT_EQ(usable, 0) << "a caller-supplied reproducible seed is not usable for secret material, so the "
+                                "bundled helpers must refuse the draw";
+    }
+
+    if (!usable) {
+        /* Fail-closed half. Nothing of the refused draw reached the caller's
+         * buffer, and the refusal is latched rather than intermittent, so a
+         * caller cannot retry its way to secret material. The docstring calls
+         * the contents undefined on failure; requiring the canary is
+         * deliberately stricter than that wording, because it is what catches
+         * a regression that fills the buffer from the weak generator and only
+         * then reports the failure. */
+        for (size_t i = 0; i < len; i++) {
+            ASSERT_EQ(buf[i], '#') << "byte " << i << " was written by a refused draw";
+        }
+        for (int retry = 0; retry < 4; retry++) {
+            memset(buf, '#', sizeof(buf));
+            ASSERT_EQ(getSecureRandomHexChars(buf, len), 0) << "retry " << retry << " stopped failing closed";
+            ASSERT_EQ(buf[0], '#') << "retry " << retry << " wrote into a refused draw";
+        }
+        return;
+    }
 
     for (size_t i = 0; i < len; i++) {
         ASSERT_TRUE((buf[i] >= '0' && buf[i] <= '9') || (buf[i] >= 'a' && buf[i] <= 'f'))
@@ -388,19 +434,42 @@ TEST_F(UtilTest, TestSecureRandomHexCharsCharset) {
  * since the canary is one byte value out of 256 per draw. That catches a stub
  * filling only a prefix, which the previous all-zeros/two-draws memcmp pair
  * did not: memcmp returns at the first differing byte, so a
- * generator writing just a[0] passed both of its assertions. */
+ * generator writing just a[0] passed both of its assertions.
+ *
+ * The failure half of the contract is asserted the same way as in
+ * TestSecureRandomHexCharsCharset: under `make test-unit seed=<n>` a bundled
+ * build must refuse the draw, a provider build is unaffected by that seed and
+ * must still succeed, so one probe decides which half to assert. */
 TEST_F(UtilTest, TestSecureRandomBytesFillsAndVaries) {
-    /* A caller-supplied reproducible seed is by construction not usable for
-     * secret material, so the secure random helpers fail closed in that mode
-     * and these tests cannot run. The skip is unconditional, and therefore
-     * conservative in BUILD_TLS=yes builds where the provider path ignores the
-     * seed entirely, rather than pulling config.h into the unit test. */
-    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
-                                         "for secret material, so the secure random helpers fail closed";
-
     constexpr size_t kLen = 64;
     constexpr int kDraws = 16;
     constexpr unsigned char kCanary = 0xA5;
+
+    unsigned char probe[kLen + 1];
+    memset(probe, kCanary, sizeof(probe));
+    int usable = getSecureRandomBytes(probe, kLen);
+    ASSERT_EQ(probe[kLen], kCanary) << "wrote past len";
+    if (seed == nullptr) {
+        ASSERT_EQ(usable, 1) << "no reproducible seed was supplied, so the draw must succeed";
+    } else if (bundledCryptoOnly()) {
+        ASSERT_EQ(usable, 0) << "a caller-supplied reproducible seed is not usable for secret material, so the "
+                                "bundled helpers must refuse the draw";
+    }
+
+    if (!usable) {
+        /* Fail-closed half, as documented for getSecureRandomHexChars() above:
+         * the refused draw left the caller's buffer alone, and the refusal is
+         * latched, not intermittent. */
+        for (size_t i = 0; i < kLen; i++) {
+            ASSERT_EQ(probe[i], kCanary) << "byte " << i << " was written by a refused draw";
+        }
+        for (int retry = 0; retry < 4; retry++) {
+            memset(probe, kCanary, sizeof(probe));
+            ASSERT_EQ(getSecureRandomBytes(probe, kLen), 0) << "retry " << retry << " stopped failing closed";
+            ASSERT_EQ(probe[0], kCanary) << "retry " << retry << " wrote into a refused draw";
+        }
+        return;
+    }
 
     bool written[kLen];
     memset(written, 0, sizeof(written));
@@ -493,20 +562,21 @@ TEST_F(UtilTest, TestRandomStreamDivergesAcrossFork) {
  *     sibling's. Siblings differ only in pid and fork time, so this is the
  *     assertion that those actually reach the derivation.
  *
- *  2. A child keeps the parent's ability to draw secret material even when it
- *     cannot reach /dev/urandom. The second child lowers RLIMIT_NOFILE to zero
- *     before drawing, so every open() it makes fails the way an fd-exhausted
+ *  2. A child inherits the parent's ability to draw secret material exactly,
+ *     neither losing it nor gaining it: the child handler re-keys from the
+ *     seed it already holds, so the documented rule is that seed strength
+ *     carries over unchanged. That makes the assertion meaningful in both
+ *     directions. A child that can draw when the parent could not would mean a
+ *     fork laundered a seed the parent had already refused to use, which is
+ *     what `make test-unit seed=<n>` exercises; a child that cannot draw when
+ *     the parent could means a fork lowered the strength, which is what the
+ *     second child below is for: it lowers RLIMIT_NOFILE to zero before
+ *     drawing, so every open() it makes fails the way an fd-exhausted
  *     process, a restricted /dev or a per-child seccomp filter would. A child
  *     that has to re-acquire entropy of its own fails or silently degrades
  *     there, which is what makes the diskless replication EOF mark guessable;
  *     a child that carries the parent's keying material forward does not. */
 TEST_F(UtilTest, TestRandomRekeysRatherThanReseedsAcrossFork) {
-    /* setRandomSeedCString() clears seed_from_urandom by design, so the secure
-     * helpers fail closed in reproducible-seed mode and property 2 cannot run
-     * there. */
-    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
-                                         "for secret material, so the secure random helpers fail closed";
-
     constexpr size_t kLen = 40;
     /* One status byte for the child's getSecureRandomBytes() result. */
     constexpr size_t kMsgLen = kLen + 1;
@@ -514,7 +584,8 @@ TEST_F(UtilTest, TestRandomRekeysRatherThanReseedsAcrossFork) {
 
     /* Draw in the parent first so the children exercise the post-fork path
      * rather than a first-draw initialization, and probe the parent's own
-     * usability: property 2 only says a child keeps what the parent had. */
+     * usability: property 2 compares each child with the parent, it does not
+     * require either of them to succeed. */
     unsigned char warmup[kLen];
     getRandomBytes(warmup, sizeof(warmup));
     int parent_usable = getSecureRandomBytes(warmup, sizeof(warmup));
@@ -568,10 +639,8 @@ TEST_F(UtilTest, TestRandomRekeysRatherThanReseedsAcrossFork) {
         ASSERT_NE(memcmp(parent_buf, child_msg[c], kLen), 0)
             << "child " << c << " continued the parent's random stream";
 
-        if (parent_usable) {
-            ASSERT_EQ(child_msg[c][kLen], 1)
-                << "child " << c << " lost the parent's ability to draw secret material across fork";
-        }
+        ASSERT_EQ(child_msg[c][kLen], parent_usable ? 1 : 0)
+            << "child " << c << " did not inherit the parent's ability to draw secret material unchanged";
     }
 
     ASSERT_NE(memcmp(child_msg[0], child_msg[1], kLen), 0) << "two children drew the same random stream";
