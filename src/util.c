@@ -1163,15 +1163,15 @@ int version2num(const char *version) {
 
 /* Global state of the bundled random generator.
  *
- * ponytail: one global mutex serialises the whole bundled generator
- * (seed_initialized, seed, seed_from_urandom and the counter in
- * getRandomBytes()). The ceiling is that every thread drawing bytes contends on
- * one lock; the upgrade path, if that ever shows up in a profile, is a
- * per-thread generator state seeded from the global one. What makes that global
- * lock fork-safe is the pthread_atfork() handler below: a forked child draws
- * random bytes (the RDB EOF mark on the diskless replication path), and without
- * it a mutex held by another thread at the instant of fork() would stay locked
- * forever in the child, with no owner left to release it. */
+ * One global mutex serialises the whole bundled generator (seed_initialized,
+ * seed, seed_from_urandom and the counter in getRandomBytes()). The cost is
+ * that every thread drawing bytes contends on one lock; if that ever shows up
+ * in a profile, the upgrade path is a per-thread generator state seeded from
+ * the global one. What makes that global lock fork-safe is the pthread_atfork()
+ * handler below: a forked child draws random bytes (the RDB EOF mark on the
+ * diskless replication path), and without it a mutex held by another thread at
+ * the instant of fork() would stay locked forever in the child, with no owner
+ * left to release it. */
 static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
 /* Set only when the 64 byte seed was actually read from /dev/urandom. The
