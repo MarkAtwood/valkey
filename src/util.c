@@ -1223,15 +1223,21 @@ static void initializeRandomSeed(void) {
 
 /* This function receives a string with 64 bytes encoded as 128 hexadecimal
  * digits, and sets the 64 byte random seed. It exists so that `make test-unit
- * seed=<n>` reproduces a run, so it deliberately leaves seed_from_urandom
- * clear: a caller-supplied seed is reproducible, hence not usable for secret
- * material. Nothing in the server calls it. */
+ * seed=<n>` reproduces a run, so it clears seed_from_urandom: a caller-supplied
+ * seed is reproducible, hence not usable for secret material, and clearing the
+ * flag here makes getSecureRandomBytes() fail closed whatever seeded the
+ * generator earlier. Nothing in the server calls it. */
 void setRandomSeedCString(char *seed_str, size_t len) {
     assert(len == sizeof(seed) * 2);
+
+    pthread_once(&random_atfork_once, registerRandomAtfork);
+    pthread_mutex_lock(&random_mutex);
     for (size_t i = 0; i < sizeof(seed); i++) {
         sscanf(seed_str + (i * 2), "%02hhX", &seed[i]);
     }
     seed_initialized = 1;
+    seed_from_urandom = 0;
+    pthread_mutex_unlock(&random_mutex);
 }
 
 /* This function populates a char buffer with 129 bytes with the 64 bytes
