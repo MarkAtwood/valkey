@@ -1178,9 +1178,9 @@ int version2num(const char *version) {
  * (see rdbSaveRioWithEOFMark()) and publishes it to every replica, and its
  * draws do not advance the parent's counter, so an inherited seed and counter
  * would leave the parent's next draw at a stream position whose output is
- * already on the wire. Clearing the seed state in the child forces a fresh
- * /dev/urandom seed on its first draw, which makes the two streams
- * independent. */
+ * already on the wire. The child handler re-keys the seed from the seed it
+ * already holds, so the two streams are independent from the child's first
+ * draw. */
 static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
 /* Set only when the 64 byte seed was actually read from /dev/urandom. The
@@ -1189,6 +1189,10 @@ static int seed_initialized = 0;
  * secret material derived from it. */
 static int seed_from_urandom = 0;
 static unsigned char seed[64]; /* 512 bit internal block size. */
+/* Counter-mode counter hashed with the seed by getRandomBytes(). Part of the
+ * mutex-protected generator state, at file scope so the atfork child handler
+ * can restart it after re-keying. */
+static uint64_t random_counter = 0;
 
 static void randomAtforkLock(void) {
     pthread_mutex_lock(&random_mutex);
@@ -1198,15 +1202,76 @@ static void randomAtforkUnlock(void) {
     pthread_mutex_unlock(&random_mutex);
 }
 
-/* Runs in the child after fork(). Dropping the inherited seed makes the next
- * draw call initializeRandomSeed() again, so the child never continues the
- * parent's stream. If /dev/urandom is unreadable there, seed_initialized stays
- * clear (a weak seed is re-derived per call, which is fine for the non-secret
- * values a child draws) and seed_from_urandom stays clear, so a secure draw in
- * the child still fails closed. */
+/* HMAC-SHA256 over the bundled SHA-256, keyed with the 64 byte generator seed,
+ * writing SHA256_BLOCK_SIZE bytes to `out`. Stack buffers only, no allocation:
+ * this also runs in the atfork child handler, where malloc() may be held by a
+ * thread that did not survive the fork. */
+static void randomHmacSha256(const unsigned char *key64, const unsigned char *msg, size_t msglen, unsigned char *out) {
+    unsigned char kxor[64];
+    SHA256_CTX ctx;
+
+    /* IKEY: key xored with 0x36. */
+    memcpy(kxor, key64, sizeof(kxor));
+    for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x36;
+
+    /* Obtain HASH(IKEY||MESSAGE). */
+    sha256_init(&ctx);
+    sha256_update(&ctx, kxor, sizeof(kxor));
+    sha256_update(&ctx, msg, msglen);
+    sha256_final(&ctx, out);
+
+    /* OKEY: key xored with 0x5c. */
+    memcpy(kxor, key64, sizeof(kxor));
+    for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x5C;
+
+    /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
+    sha256_init(&ctx);
+    sha256_update(&ctx, kxor, sizeof(kxor));
+    sha256_update(&ctx, out, SHA256_BLOCK_SIZE);
+    sha256_final(&ctx, out);
+}
+
+/* Runs in the child after fork(). The child must not continue the parent's
+ * stream: its draws do not advance the parent's counter, and the RDB child
+ * publishes its draw (the diskless replication EOF mark) to every replica, so
+ * an inherited seed and counter would put the parent's next draw at a position
+ * whose output is already on the wire.
+ *
+ * Divergence is obtained by re-keying, not by reseeding: the child derives a
+ * fresh seed from the seed it already holds, mixed with its pid and the time of
+ * the fork, and restarts the counter. Dropping the inherited seed and forcing
+ * initializeRandomSeed() to run again would instead make the child depend on
+ * /dev/urandom still being readable there; when it is not (an fd-exhausted
+ * process, a restricted /dev, a per-child seccomp filter) the seed would fall
+ * back to the clock/pid derivation, which is worth a few tens of bits. The EOF
+ * mark is not secret, but a guessable mark can be planted inside a value by any
+ * client with write access, so a fork must never lower its strength. Re-keying
+ * inherits whatever strength the parent's seed had, so seed_initialized and
+ * seed_from_urandom carry over unchanged.
+ *
+ * getpid() and gettimeofday() are async-signal-safe and everything else here is
+ * stack computation, so the handler is fork-safe. */
 static void randomAtforkChild(void) {
-    seed_initialized = 0;
-    seed_from_urandom = 0;
+    if (seed_initialized) {
+        struct {
+            pid_t pid;
+            struct timeval tv;
+            unsigned char block;
+        } msg;
+        unsigned char rekeyed[sizeof(seed)];
+
+        memset(&msg, 0, sizeof(msg));
+        msg.pid = getpid();
+        gettimeofday(&msg.tv, NULL);
+
+        msg.block = 0;
+        randomHmacSha256(seed, (const unsigned char *)&msg, sizeof(msg), rekeyed);
+        msg.block = 1;
+        randomHmacSha256(seed, (const unsigned char *)&msg, sizeof(msg), rekeyed + SHA256_BLOCK_SIZE);
+
+        memcpy(seed, rekeyed, sizeof(seed));
+        random_counter = 0;
+    }
     pthread_mutex_unlock(&random_mutex);
 }
 
@@ -1296,8 +1361,6 @@ void getRandomSeedCString(char *buff, size_t len) {
  * falls back to this generator, and gates that fallback on the seed having come
  * from /dev/urandom. */
 void getRandomBytes(unsigned char *p, size_t len) {
-    static uint64_t counter = 0; /* The counter we hash with the seed. */
-
     pthread_once(&random_atfork_once, registerRandomAtfork);
     pthread_mutex_lock(&random_mutex);
     if (!seed_initialized) {
@@ -1305,34 +1368,13 @@ void getRandomBytes(unsigned char *p, size_t len) {
     }
 
     while (len) {
-        /* This implements SHA256-HMAC. */
         unsigned char digest[SHA256_BLOCK_SIZE];
-        unsigned char kxor[64];
         unsigned int copylen = len > SHA256_BLOCK_SIZE ? SHA256_BLOCK_SIZE : len;
 
-        /* IKEY: key xored with 0x36. */
-        memcpy(kxor, seed, sizeof(kxor));
-        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x36;
-
-        /* Obtain HASH(IKEY||MESSAGE). */
-        SHA256_CTX ctx;
-        sha256_init(&ctx);
-        sha256_update(&ctx, kxor, sizeof(kxor));
-        sha256_update(&ctx, (unsigned char *)&counter, sizeof(counter));
-        sha256_final(&ctx, digest);
-
-        /* OKEY: key xored with 0x5c. */
-        memcpy(kxor, seed, sizeof(kxor));
-        for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x5C;
-
-        /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
-        sha256_init(&ctx);
-        sha256_update(&ctx, kxor, sizeof(kxor));
-        sha256_update(&ctx, digest, SHA256_BLOCK_SIZE);
-        sha256_final(&ctx, digest);
+        randomHmacSha256(seed, (unsigned char *)&random_counter, sizeof(random_counter), digest);
 
         /* Increment the counter for the next iteration. */
-        counter++;
+        random_counter++;
 
         memcpy(p, digest, copylen);
         len -= copylen;

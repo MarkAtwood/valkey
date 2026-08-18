@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstring>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -482,4 +483,96 @@ TEST_F(UtilTest, TestRandomStreamDivergesAcrossFork) {
 
     ASSERT_NE(memcmp(parent_buf, child_buf, sizeof(parent_buf)), 0)
         << "the forked child continued the parent's random stream";
+}
+
+/* Forking must diversify the generator, never downgrade it. Two properties are
+ * asserted, both taken from the documented fork contract rather than from the
+ * generator's own output:
+ *
+ *  1. Every child draws a stream distinct from the parent's and from any
+ *     sibling's. Siblings differ only in pid and fork time, so this is the
+ *     assertion that those actually reach the derivation.
+ *
+ *  2. A child keeps the parent's ability to draw secret material even when it
+ *     cannot reach /dev/urandom. The second child lowers RLIMIT_NOFILE to zero
+ *     before drawing, so every open() it makes fails the way an fd-exhausted
+ *     process, a restricted /dev or a per-child seccomp filter would. A child
+ *     that has to re-acquire entropy of its own fails or silently degrades
+ *     there, which is what makes the diskless replication EOF mark guessable;
+ *     a child that carries the parent's keying material forward does not. */
+TEST_F(UtilTest, TestRandomRekeysRatherThanReseedsAcrossFork) {
+    /* setRandomSeedCString() clears seed_from_urandom by design, so the secure
+     * helpers fail closed in reproducible-seed mode and property 2 cannot run
+     * there. */
+    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
+                                         "for secret material, so the secure random helpers fail closed";
+
+    constexpr size_t kLen = 40;
+    /* One status byte for the child's getSecureRandomBytes() result. */
+    constexpr size_t kMsgLen = kLen + 1;
+    constexpr int kChildren = 2;
+
+    /* Draw in the parent first so the children exercise the post-fork path
+     * rather than a first-draw initialization, and probe the parent's own
+     * usability: property 2 only says a child keeps what the parent had. */
+    unsigned char warmup[kLen];
+    getRandomBytes(warmup, sizeof(warmup));
+    int parent_usable = getSecureRandomBytes(warmup, sizeof(warmup));
+
+    unsigned char child_msg[kChildren][kMsgLen];
+    pid_t pids[kChildren];
+    int read_fds[kChildren];
+
+    for (int c = 0; c < kChildren; c++) {
+        int fds[2];
+        ASSERT_EQ(pipe(fds), 0);
+
+        pids[c] = fork();
+        ASSERT_NE(pids[c], -1);
+        if (pids[c] == 0) {
+            /* No gtest assertions here: they are not valid in the child. */
+            unsigned char msg[kMsgLen];
+            unsigned char secure[kLen];
+            /* Already open descriptors, the pipe included, survive this; only
+             * new ones are refused. */
+            struct rlimit no_files = {0, 0};
+            if (c == 1 && setrlimit(RLIMIT_NOFILE, &no_files) != 0) _exit(2);
+            getRandomBytes(msg, kLen);
+            msg[kLen] = getSecureRandomBytes(secure, sizeof(secure)) ? 1 : 0;
+            ssize_t written = write(fds[1], msg, sizeof(msg));
+            _exit(written == (ssize_t)sizeof(msg) ? 0 : 1);
+        }
+        ASSERT_EQ(close(fds[1]), 0);
+        read_fds[c] = fds[0];
+    }
+
+    unsigned char parent_buf[kLen];
+    getRandomBytes(parent_buf, sizeof(parent_buf));
+
+    for (int c = 0; c < kChildren; c++) {
+        size_t got = 0;
+        while (got < kMsgLen) {
+            ssize_t n = read(read_fds[c], child_msg[c] + got, kMsgLen - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        ASSERT_EQ(close(read_fds[c]), 0);
+
+        int status = 0;
+        ASSERT_EQ(waitpid(pids[c], &status, 0), pids[c]);
+        ASSERT_TRUE(WIFEXITED(status));
+        ASSERT_EQ(WEXITSTATUS(status), 0) << "child " << c << " failed to report its draw";
+        ASSERT_EQ(got, kMsgLen) << "child " << c << " reported a short draw";
+
+        /* Two equal 40 byte draws is a 2^-320 event. */
+        ASSERT_NE(memcmp(parent_buf, child_msg[c], kLen), 0)
+            << "child " << c << " continued the parent's random stream";
+
+        if (parent_usable) {
+            ASSERT_EQ(child_msg[c][kLen], 1)
+                << "child " << c << " lost the parent's ability to draw secret material across fork";
+        }
+    }
+
+    ASSERT_NE(memcmp(child_msg[0], child_msg[1], kLen), 0) << "two children drew the same random stream";
 }
