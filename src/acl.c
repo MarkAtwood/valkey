@@ -1602,6 +1602,14 @@ static void ACLLogCryptoFailure(const char *context, const char *hint) {
     errno = saved_errno;
 }
 
+/* Report a failure to hash the requirepass password, for the CONFIG SET path.
+ * ACLLogCryptoFailure() and the ACL_CRYPTO_HINT_* strings are build conditional
+ * and stay private to this file, so updateRequirePass() cannot call them
+ * directly. */
+void ACLLogRequirePassHashFailure(void) {
+    ACLLogCryptoFailure("Hashing the requirepass password", ACL_CRYPTO_HINT_DIGEST);
+}
+
 /* Create the default user, this has special permissions. */
 static user *ACLCreateDefaultUser(void) {
     user *new = ACLCreateUser("default", 7);

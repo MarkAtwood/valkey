@@ -2773,6 +2773,11 @@ int updateRequirePass(const char **err) {
      * additionally is to remember the cleartext password in this
      * case, for backward compatibility. */
     if (ACLUpdateDefaultUserPassword(server.requirepass) != C_OK) {
+        /* Logged here and not inside ACLUpdateDefaultUserPassword(): the other
+         * caller, initServer(), fetches the reason itself for its FATAL line,
+         * and the fetch drains the crypto backend error queue, so the reason
+         * may be fetched exactly once per failure. */
+        ACLLogRequirePassHashFailure();
         /* Returning 0 makes CONFIG SET reply an error and restore the previous
          * server.requirepass, but the default user has already lost its
          * passwords and the restore re-applies this same function, so it fails
