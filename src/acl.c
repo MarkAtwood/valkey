@@ -2567,14 +2567,25 @@ static int ACLLoadConfiguredUsers(void) {
         /* Load every rule defined for this user. */
         for (int j = 1; aclrules[j]; j++) {
             if (ACLSetUser(u, aclrules[j], sdslen(aclrules[j])) != C_OK) {
+                /* ACLSetUserStringError() and ACLLogCryptoFailure() run before
+                 * the tests below, so capture the failure kind first. */
+                int saved_errno = errno;
                 const char *errmsg = ACLSetUserStringError();
-                if (errno == EIO)
+                if (saved_errno == EIO)
                     ACLLogCryptoFailure("Hashing a password for a user directive in the configuration file",
                                         ACL_CRYPTO_HINT_DIGEST);
-                serverLog(LL_WARNING,
-                          "Error loading ACL rule '%s' for "
-                          "the user named '%s': %s",
-                          aclrules[j], aclrules[0], errmsg);
+                if (saved_errno == ENOENT) {
+                    /* Same reason ACLLoadFromFile() gives: for missing commands
+                     * we print out more information since it shouldn't contain
+                     * any sensitive information. Any other rule may be a
+                     * '>cleartextpassword', which must not reach the log. */
+                    serverLog(LL_WARNING,
+                              "Error loading ACL rule '%s' for "
+                              "the user named '%s': %s",
+                              aclrules[j], aclrules[0], errmsg);
+                } else {
+                    serverLog(LL_WARNING, "Error loading an ACL rule for the user named '%s': %s", aclrules[0], errmsg);
+                }
                 return C_ERR;
             }
         }
