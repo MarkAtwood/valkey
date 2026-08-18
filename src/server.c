@@ -3123,7 +3123,26 @@ void initServer(void) {
     initSharedQueryBuf();
 
     /* Initialize ACL default password if it exists */
-    ACLUpdateDefaultUserPassword(server.requirepass);
+    if (ACLUpdateDefaultUserPassword(server.requirepass) != C_OK) {
+        /* Fail closed: the default user is now without any usable password, so
+         * refuse to start rather than come up unauthenticatable. serverLog() is
+         * usable here, unlike at the hash seed site that runs before
+         * initServerConfig(). exit() and not serverPanic(): this is an operator
+         * visible misconfiguration, not a server bug worth a crash report. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+        serverLog(LL_WARNING,
+                  "FATAL: hashing the requirepass password failed. Check the crypto provider "
+                  "selected in openssl.cnf: a provider that fails its self test, or that supplies no "
+                  "SHA-256, makes every digest fail here on the very first call. Refusing to start "
+                  "rather than run with a default user that nobody can authenticate as.");
+#else
+        serverLog(LL_WARNING,
+                  "FATAL: hashing the requirepass password failed, the SHA-256 digest returned an "
+                  "error. Refusing to start rather than run with a default user that nobody can "
+                  "authenticate as.");
+#endif
+        exit(1);
+    }
 
     /* Initialize the functions engine based off of LUA initialization. */
     if (functionsInit() == C_ERR) {

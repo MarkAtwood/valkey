@@ -2768,12 +2768,23 @@ static int updateLuaEnableInsecureApi(const char **err) {
 }
 
 int updateRequirePass(const char **err) {
-    UNUSED(err);
     /* The old "requirepass" directive just translates to setting
      * a password to the default user. The only thing we do
      * additionally is to remember the cleartext password in this
      * case, for backward compatibility. */
-    ACLUpdateDefaultUserPassword(server.requirepass);
+    if (ACLUpdateDefaultUserPassword(server.requirepass) != C_OK) {
+        /* Returning 0 makes CONFIG SET reply an error and restore the previous
+         * server.requirepass, but the default user has already lost its
+         * passwords and the restore re-applies this same function, so it fails
+         * again whenever the previous value was a password. Say so, the two
+         * really do diverge. */
+        *err = "Hashing the password failed. Check the crypto provider selected in openssl.cnf. "
+               "requirepass is restored to its previous value, but the default user's password list "
+               "was already cleared and the previous password cannot be hashed either, so if "
+               "requirepass was set before, the default user has no usable password until the "
+               "crypto provider works again and requirepass is set once more";
+        return 0;
+    }
     return 1;
 }
 

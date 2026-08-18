@@ -3543,14 +3543,30 @@ void authCommand(client *c) {
 }
 
 /* Set the password for the "default" ACL user. This implements supports for
- * requirepass config, so passing in NULL will set the user to be nopass. */
-void ACLUpdateDefaultUserPassword(sds password) {
-    ACLSetUser(DefaultUser, "resetpass", -1);
+ * requirepass config, so passing in NULL will set the user to be nopass.
+ *
+ * Returns C_OK on success, or C_ERR with errno set as ACLSetUser() set it when
+ * hashing the password failed. On that failure the default user is left in the
+ * state "resetpass" produced: no passwords and USER_FLAG_NOPASS cleared, so
+ * nobody can authenticate as default. That is deliberate and fail closed: a
+ * hash failure must never leave the default user reachable. The caller is
+ * responsible for reporting the failure, since the default user is now without
+ * a usable password whatever it decides to do. */
+int ACLUpdateDefaultUserPassword(sds password) {
+    /* "resetpass" and "nopass" only touch the flags and the password list, so
+     * unlike the '>' op below they cannot fail. */
+    serverAssert(ACLSetUser(DefaultUser, "resetpass", -1) == C_OK);
     if (password) {
         sds aclop = sdscatlen(sdsnew(">"), password, sdslen(password));
-        ACLSetUser(DefaultUser, aclop, sdslen(aclop));
+        int retval = ACLSetUser(DefaultUser, aclop, sdslen(aclop));
+        int saved_errno = errno;
         sdsfree(aclop);
+        if (retval != C_OK) {
+            errno = saved_errno;
+            return C_ERR;
+        }
     } else {
-        ACLSetUser(DefaultUser, "nopass", -1);
+        serverAssert(ACLSetUser(DefaultUser, "nopass", -1) == C_OK);
     }
+    return C_OK;
 }
