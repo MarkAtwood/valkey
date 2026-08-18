@@ -17,6 +17,8 @@ extern "C" {
 #include "util.h"
 
 extern bool valgrind;
+/* From main.cpp: non-NULL when --seed was passed (make test-unit seed=<n>). */
+extern char *seed;
 }
 
 #if defined(__linux__)
@@ -352,6 +354,14 @@ TEST_F(UtilTest, TestWritePointerWithPadding) {
  * len. The charset is the documented contract, so it is an oracle independent
  * of whichever generator backs the call (provider RAND or the bundled one). */
 TEST_F(UtilTest, TestSecureRandomHexCharsCharset) {
+    /* A caller-supplied reproducible seed is by construction not usable for
+     * secret material, so the secure random helpers fail closed in that mode
+     * and these tests cannot run. The skip is unconditional, and therefore
+     * conservative in BUILD_TLS=yes builds where the provider path ignores the
+     * seed entirely, rather than pulling config.h into the unit test. */
+    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
+                                         "for secret material, so the secure random helpers fail closed";
+
     char buf[128];
     const size_t len = sizeof(buf) - 1;
 
@@ -372,11 +382,20 @@ TEST_F(UtilTest, TestSecureRandomHexCharsCharset) {
  * The oracle is independent of the generator: the buffer is prefilled with a
  * canary and drawn into kDraws times. If some position is never written it
  * holds the canary in every draw; if it is written, it survives as the canary
- * in all kDraws draws only with probability 2^-kDraws (2^-16 here). That
- * catches a stub filling only a prefix, which the previous all-zeros/two-draws
- * memcmp pair did not: memcmp returns at the first differing byte, so a
+ * in all kDraws draws only with probability (2^-8)^kDraws (2^-128 here),
+ * since the canary is one byte value out of 256 per draw. That catches a stub
+ * filling only a prefix, which the previous all-zeros/two-draws memcmp pair
+ * did not: memcmp returns at the first differing byte, so a
  * generator writing just a[0] passed both of its assertions. */
 TEST_F(UtilTest, TestSecureRandomBytesFillsAndVaries) {
+    /* A caller-supplied reproducible seed is by construction not usable for
+     * secret material, so the secure random helpers fail closed in that mode
+     * and these tests cannot run. The skip is unconditional, and therefore
+     * conservative in BUILD_TLS=yes builds where the provider path ignores the
+     * seed entirely, rather than pulling config.h into the unit test. */
+    if (seed != nullptr) GTEST_SKIP() << "reproducible --seed mode: a caller-supplied deterministic seed is not usable "
+                                         "for secret material, so the secure random helpers fail closed";
+
     constexpr size_t kLen = 64;
     constexpr int kDraws = 16;
     constexpr unsigned char kCanary = 0xA5;

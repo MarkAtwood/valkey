@@ -1378,8 +1378,11 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * to determine the length.
  *
  * The function returns C_OK if the action to perform was understood because
- * the 'op' string made sense. Otherwise C_ERR is returned if the operation
- * is unknown or has some syntax error.
+ * the 'op' string made sense. Otherwise C_ERR is returned, either because the
+ * operation is unknown or has some syntax error, or because a well formed
+ * operation could not be carried out server side: a '>password' or '<password'
+ * op returns C_ERR with errno EIO when hashing the password fails, so C_ERR
+ * alone no longer means the rule was bad.
  *
  * When an error is returned, errno is set to the following values:
  *
@@ -1395,6 +1398,9 @@ static int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen) {
  * EBADMSG: The hash you are trying to add is not a valid hash.
  * ECHILD: Attempt to allow a specific first argument of a subcommand
  * ERANGE: A database ID provided with the db= rule is out of the supported range.
+ * EIO: Hashing the password of a '>password' or '<password' op failed. The rule
+ *      itself is valid: this is a server side crypto failure, not a syntax
+ *      error, and must not be reported to the user as a malformed rule.
  */
 int ACLSetUser(user *u, const char *op, ssize_t oplen) {
     /* as we are changing the ACL, the old generated string is now invalid */
@@ -1568,6 +1574,9 @@ void ACLInit(void) {
  *
  *  EINVAL: if the username-password do not match.
  *  ENOENT: if the specified user does not exist at all.
+ *  EIO: if hashing the supplied password failed server side. No credential
+ *       decision was made, so callers must not log or count this as an
+ *       authentication failure.
  */
 int ACLCheckUserCredentials(robj *username, robj *password) {
     user *u = ACLGetUserByName(objectGetVal(username), sdslen(objectGetVal(username)));
@@ -1632,7 +1641,10 @@ void addAuthErrReply(client *c, robj *err) {
  * The return value is AUTH_OK on success (valid username / password pair) & AUTH_ERR otherwise.
  * If hashing the password failed, `*err` is set to the error to report to the
  * client: that is a server side failure, not a rejected credential, and it must
- * not take the server down since AUTH is reachable unauthenticated. */
+ * not take the server down since AUTH is reachable unauthenticated. That path
+ * deliberately fires neither the ACL log entry nor the module authentication
+ * event, because no authentication decision was made and an audit or lockout
+ * module must not count a crypto outage as a credential failure. */
 static int checkPasswordBasedAuth(client *c, robj *username, robj *password, robj **err) {
     int result;
 
@@ -1644,6 +1656,8 @@ static int checkPasswordBasedAuth(client *c, robj *username, robj *password, rob
     } else if (errno == EIO) {
         const char *msg = "-ERR hashing the password failed, check the crypto provider selected in openssl.cnf";
         *err = createStringObject(msg, strlen(msg));
+        /* Skips the module authentication event for the same reason the ACL log
+         * entry is skipped below: no authentication decision was made. */
         return AUTH_ERR;
     } else {
         addACLLogEntry(c, ACL_DENIED_AUTH, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, 0, objectGetVal(username),
@@ -3323,8 +3337,13 @@ void aclCommand(client *c) {
             /* Fail closed: never emit a password from a weaker generator. This
              * must stay an error reply, not a panic: GENPASS is a client
              * command and a provider failure must not take the server down. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
             addReplyError(c, "Failed to generate a password: the CSPRNG returned an error. "
                              "Check the crypto provider selected in openssl.cnf and its DRBG");
+#else
+            addReplyError(c, "Failed to generate a password: the 64 byte random seed could not be read "
+                             "from /dev/urandom. Check that /dev/urandom is readable by this process");
+#endif
             return;
         }
         addReplyBulkCBuffer(c, pass, chars);

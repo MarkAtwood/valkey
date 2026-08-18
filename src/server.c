@@ -52,6 +52,7 @@
 #include "module.h"
 #include "scripting_engine.h"
 #include "util.h"
+#include "sha256.h"
 
 #include "eval.h"
 
@@ -7535,11 +7536,20 @@ __attribute__((weak)) int main(int argc, char **argv) {
          * unusable here: server.logfile is still NULL and serverLogRaw() would
          * dereference it, crashing with no diagnostic at all. Report on stderr
          * and refuse to start. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
         fprintf(stderr, "FATAL: the CSPRNG failed to supply the hash table seed.\n"
                         "Check the crypto provider selected in openssl.cnf and its DRBG: a provider "
                         "that fails its self test, or that supplies no DRBG, makes RAND_priv_bytes() "
                         "fail here on the very first call.\n"
                         "Refusing to start rather than seed the hash function from a non-CSPRNG.\n");
+#else
+        fprintf(stderr, "FATAL: the 64 byte random seed could not be read from /dev/urandom.\n"
+                        "This build has no crypto provider, so /dev/urandom is the only source: check "
+                        "that it exists and is readable here, a container with a restricted /dev, a "
+                        "seccomp filter blocking the open, or an fd-exhausted process all break it.\n"
+                        "Refusing to start rather than derive the hash seed from the clock/pid "
+                        "fallback.\n");
+#endif
         fflush(stderr);
         exit(1);
     }
@@ -7801,13 +7811,27 @@ __attribute__((weak)) int main(int argc, char **argv) {
     InitServerLast();
 
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    /* Validate the SHA-256 binding before announcing it. The EVP_MD fetch is
+     * lazy and its failure is permanent, so without this an unusable provider
+     * surfaces as every AUTH failing forever on a server that logged a clean
+     * start. Known answer test against the FIPS 180-2 published digest of
+     * "abc", an oracle external to the implementation under test. */
+    static const unsigned char sha256_abc[SHA256_BLOCK_SIZE] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+    unsigned char sha256_selftest[SHA256_BLOCK_SIZE];
+    if (!digestSHA256(sha256_selftest, "abc", 3) || memcmp(sha256_selftest, sha256_abc, SHA256_BLOCK_SIZE) != 0) {
+        serverLog(LL_WARNING, "The SHA-256 implementation reachable through the crypto provider selected in "
+                              "openssl.cnf is missing or returns the wrong digest. ACL password hashing and "
+                              "AUTH would fail for every client. Exiting.");
+        exit(1);
+    }
     serverLog(LL_NOTICE, "Provider-backed crypto enabled: ACL password hashing and secret random material "
                          "are served by the crypto provider selected in openssl.cnf.");
 #else
-    serverLog(LL_NOTICE, "Provider-backed crypto disabled: ACL password hashing and secret random material "
-                         "use the bundled implementations, with no provider or FIPS guarantee. It requires a "
-                         "BUILD_TLS=yes build against OpenSSL 3.0 or later (not LibreSSL); BUILD_TLS=module "
-                         "does not link libcrypto into the server itself.");
+    serverLog(LL_VERBOSE, "Provider-backed crypto disabled: ACL password hashing and secret random material "
+                          "use the bundled implementations (requires BUILD_TLS=yes against OpenSSL 3.0 or "
+                          "later).");
 #endif
 
     if (!server.sentinel_mode) {

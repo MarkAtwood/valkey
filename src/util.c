@@ -1069,12 +1069,30 @@ err:
  *
  * The NULL property query keeps Valkey provider-agnostic; openssl.cnf selects
  * the active provider. If the fetch fails the pointer stays NULL and every
- * digest reports failure, rather than falling back to the bundled code. */
+ * digest reports failure, rather than falling back to the bundled code.
+ *
+ * The binding is validated at startup: main() in server.c runs a known answer
+ * SHA-256 self test and refuses to start when it fails, so this lazy fetch is
+ * warmed there rather than by the first AUTH, and a provider that cannot serve
+ * SHA-256 is reported at boot instead of to the first client. */
 static EVP_MD *sha256_md = NULL;
 static pthread_once_t sha256_md_once = PTHREAD_ONCE_INIT;
 
 static void fetchSHA256MD(void) {
-    sha256_md = EVP_MD_fetch(NULL, "SHA256", NULL);
+    EVP_MD *md = EVP_MD_fetch(NULL, "SHA256", NULL);
+    if (md == NULL) return;
+
+    /* Validate the output size here, not after a digest has run: callers give
+     * digestSHA256() a SHA256_BLOCK_SIZE byte buffer and EVP_Digest() writes
+     * EVP_MD_get_size() bytes into it, so a provider advertising any other size
+     * has to be rejected before it can overflow that buffer. EVP_MD_get_size()
+     * returns an int and may be negative, so anything but an exact match is a
+     * failure and leaves sha256_md NULL: every digest then fails closed. */
+    if (EVP_MD_get_size(md) != SHA256_BLOCK_SIZE) {
+        EVP_MD_free(md);
+        return;
+    }
+    sha256_md = md;
 }
 #endif
 
@@ -1095,8 +1113,8 @@ int digestSHA256(unsigned char *digest, const void *data, size_t len) {
 
     pthread_once(&sha256_md_once, fetchSHA256MD);
     if (sha256_md == NULL) return 0;
+    /* The output size was validated when the EVP_MD was fetched. */
     if (EVP_Digest(data, len, digest, &digest_len, sha256_md, NULL) != 1) return 0;
-    if (digest_len != SHA256_BLOCK_SIZE) return 0;
 #else
     SHA256_CTX ctx;
     sha256_init(&ctx);
@@ -1149,7 +1167,11 @@ int version2num(const char *version) {
  * (seed_initialized, seed, seed_from_urandom and the counter in
  * getRandomBytes()). The ceiling is that every thread drawing bytes contends on
  * one lock; the upgrade path, if that ever shows up in a profile, is a
- * per-thread generator state seeded from the global one. */
+ * per-thread generator state seeded from the global one. What makes that global
+ * lock fork-safe is the pthread_atfork() handler below: a forked child draws
+ * random bytes (the RDB EOF mark on the diskless replication path), and without
+ * it a mutex held by another thread at the instant of fork() would stay locked
+ * forever in the child, with no owner left to release it. */
 static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
 /* Set only when the 64 byte seed was actually read from /dev/urandom. The
@@ -1158,6 +1180,22 @@ static int seed_initialized = 0;
  * secret material derived from it. */
 static int seed_from_urandom = 0;
 static unsigned char seed[64]; /* 512 bit internal block size. */
+
+static void randomAtforkLock(void) {
+    pthread_mutex_lock(&random_mutex);
+}
+
+static void randomAtforkUnlock(void) {
+    pthread_mutex_unlock(&random_mutex);
+}
+
+/* Registered exactly once, via random_atfork_once, by every entry point that
+ * takes random_mutex, so registration always happens before the first fork(). */
+static pthread_once_t random_atfork_once = PTHREAD_ONCE_INIT;
+
+static void registerRandomAtfork(void) {
+    pthread_atfork(randomAtforkLock, randomAtforkUnlock, randomAtforkUnlock);
+}
 
 /* Call with random_mutex held, or before any other thread exists. */
 static void initializeRandomSeed(void) {
@@ -1201,6 +1239,8 @@ void setRandomSeedCString(char *seed_str, size_t len) {
 void getRandomSeedCString(char *buff, size_t len) {
     assert(len == (sizeof(seed) * 2 + 1));
 
+    pthread_once(&random_atfork_once, registerRandomAtfork);
+    pthread_mutex_lock(&random_mutex);
     if (!seed_initialized) {
         initializeRandomSeed();
     }
@@ -1208,6 +1248,7 @@ void getRandomSeedCString(char *buff, size_t len) {
     for (size_t i = 0; i < sizeof(seed); i++) {
         snprintf(buff + (i * 2), 3, "%02hhX", seed[i]);
     }
+    pthread_mutex_unlock(&random_mutex);
     buff[sizeof(seed) * 2] = '\0';
 }
 
@@ -1218,15 +1259,19 @@ void getRandomSeedCString(char *buff, size_t len) {
  * The generator state (seed and counter) is global and is serialised with
  * random_mutex, so concurrent callers get distinct output.
  *
- * This is the non-security entry point. Direct callers are the module API
- * (ValkeyModule_GetRandomBytes, so arbitrary module code) and the hashtable
- * unit test; the rest of the tree reaches it through getRandomHexChars() for
- * the run id, the replication id, cluster node names and shard ids, the
- * sentinel id, the RDB EOF mark and migrate slot job names. Secret material
- * must use getSecureRandomBytes() below instead. */
+ * This is the non-security entry point: what reaches it, directly or through
+ * getRandomHexChars(), wants values that do not collide rather than values that
+ * cannot be guessed - the run id, the replication id, cluster node names and
+ * shard ids, the sentinel id, the RDB EOF mark, migrate slot job names, the
+ * hashtable unit test, and ValkeyModule_GetRandomBytes(), so arbitrary module
+ * code. Secret material must use getSecureRandomBytes() below, which is itself
+ * the one caller here that draws secrets: in builds without provider crypto it
+ * falls back to this generator, and gates that fallback on the seed having come
+ * from /dev/urandom. */
 void getRandomBytes(unsigned char *p, size_t len) {
     static uint64_t counter = 0; /* The counter we hash with the seed. */
 
+    pthread_once(&random_atfork_once, registerRandomAtfork);
     pthread_mutex_lock(&random_mutex);
     if (!seed_initialized) {
         initializeRandomSeed();
@@ -1314,6 +1359,7 @@ int getSecureRandomBytes(unsigned char *p, size_t len) {
     }
     return 1;
 #else
+    pthread_once(&random_atfork_once, registerRandomAtfork);
     pthread_mutex_lock(&random_mutex);
     if (!seed_initialized) initializeRandomSeed();
     int usable = seed_from_urandom;

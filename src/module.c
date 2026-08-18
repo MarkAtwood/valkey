@@ -11337,7 +11337,12 @@ double VM_ServerInfoGetFieldDouble(ValkeyModuleServerInfoData *data, const char 
 /* Return random bytes using SHA1 in counter mode with a /dev/urandom
  * initialized seed. This function is fast so can be used to generate
  * many bytes without any effect on the operating system entropy pool.
- * Currently this function is not thread safe. */
+ * Concurrent callers are serialised internally, so this is safe to call from
+ * any thread and each caller gets distinct output.
+ *
+ * This is the fast non-cryptographic generator, meant for identifiers such as
+ * run ids. For secret material such as keys, tokens and nonces use
+ * ValkeyModule_GetSecureRandomBytes() instead. */
 void VM_GetRandomBytes(unsigned char *dst, size_t len) {
     getRandomBytes(dst, len);
 }
