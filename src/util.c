@@ -1270,20 +1270,26 @@ static void randomHmacSha256(const unsigned char *key64, const unsigned char *ms
  * inherits whatever strength the parent's seed had, so seed_initialized and
  * seed_from_urandom carry over unchanged.
  *
- * getpid() and gettimeofday() are async-signal-safe and everything else here is
- * stack computation, so the handler is fork-safe. */
+ * A child handler runs under the same restriction as a signal handler: after a
+ * fork() in a multithreaded process only the POSIX async-signal-safe functions
+ * may be called. getpid() and clock_gettime() are on that list and everything
+ * else here is stack computation. gettimeofday() is not on it, which is why the
+ * handler reads the clock with clock_gettime(); the value only has to be unique
+ * per fork, not accurate. The closing pthread_mutex_unlock() is not on the list
+ * either: it is safe here only because the prepare handler took the lock in
+ * what is now the only surviving thread. */
 static void randomAtforkChild(void) {
     if (seed_initialized) {
         struct {
             pid_t pid;
-            struct timeval tv;
+            struct timespec ts;
             unsigned char block;
         } msg;
         unsigned char rekeyed[sizeof(seed)];
 
         memset(&msg, 0, sizeof(msg));
         msg.pid = getpid();
-        gettimeofday(&msg.tv, NULL);
+        clock_gettime(CLOCK_REALTIME, &msg.ts);
 
         msg.block = 0;
         randomHmacSha256(seed, (const unsigned char *)&msg, sizeof(msg), rekeyed);
