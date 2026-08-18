@@ -11334,7 +11334,7 @@ double VM_ServerInfoGetFieldDouble(ValkeyModuleServerInfoData *data, const char 
  * ## Modules utility APIs
  * -------------------------------------------------------------------------- */
 
-/* Return random bytes using SHA1 in counter mode with a /dev/urandom
+/* Return random bytes using HMAC-SHA256 in counter mode with a /dev/urandom
  * initialized seed. This function is fast so can be used to generate
  * many bytes without any effect on the operating system entropy pool.
  * Concurrent callers are serialised internally, so this is safe to call from

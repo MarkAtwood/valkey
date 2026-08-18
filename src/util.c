@@ -1200,7 +1200,7 @@ static void registerRandomAtfork(void) {
 /* Call with random_mutex held, or before any other thread exists. */
 static void initializeRandomSeed(void) {
     assert(seed_initialized == 0);
-    /* Initialize a seed and use SHA1 in counter mode, where we hash
+    /* Initialize a seed and use HMAC-SHA256 in counter mode, where we hash
      * the same seed with a progressive counter. For the goals of this
      * function we just need non-colliding strings, there are no
      * cryptographic security needs. */
@@ -1253,7 +1253,7 @@ void getRandomSeedCString(char *buff, size_t len) {
 }
 
 /* Get random bytes, attempts to get an initial seed from /dev/urandom and
- * the uses a one way hash function in counter mode to generate a random
+ * the uses HMAC-SHA256 in counter mode to generate a random
  * stream. However if /dev/urandom is not available, a weaker seed is used.
  *
  * The generator state (seed and counter) is global and is serialised with
