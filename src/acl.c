@@ -1582,13 +1582,20 @@ static void ACLLogCryptoFailure(const char *context, const char *hint) {
     static mstime_t last_log = 0;
     /* Callers test errno after this returns: ACLSetUser() reports its failure
      * kind through errno, and neither mstime() nor serverLog() is documented
-     * to preserve it. */
+     * to preserve it. Save it before getCryptoFailureReason() too, whose
+     * OpenSSL ERR_* calls may clobber it. */
     int saved_errno = errno;
+    char reason[256]; /* ERR_error_string_n() wants at least 256 bytes. */
     mstime_t now = mstime();
+
+    /* Unconditionally, before the rate limit test: the call drains the crypto
+     * backend error queue, so a suppressed line still clears it and a later
+     * failure cannot be reported with the stale reason of a suppressed one. */
+    getCryptoFailureReason(reason, sizeof(reason));
 
     if (last_log == 0 || now - last_log >= 1000) {
         last_log = now;
-        serverLog(LL_WARNING, "%s failed. %s", context, hint);
+        serverLog(LL_WARNING, "%s failed. %s %s", context, hint, reason);
     }
     errno = saved_errno;
 }

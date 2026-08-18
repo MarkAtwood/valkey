@@ -3129,17 +3129,22 @@ void initServer(void) {
          * usable here, unlike at the hash seed site that runs before
          * initServerConfig(). exit() and not serverPanic(): this is an operator
          * visible misconfiguration, not a server bug worth a crash report. */
+        char reason[256];
+        getCryptoFailureReason(reason, sizeof(reason));
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
         serverLog(LL_WARNING,
                   "FATAL: hashing the requirepass password failed. Check the crypto provider "
                   "selected in openssl.cnf: a provider that fails its self test, or that supplies no "
                   "SHA-256, makes every digest fail here on the very first call. Refusing to start "
-                  "rather than run with a default user that nobody can authenticate as.");
+                  "rather than run with a default user that nobody can authenticate as. Reason "
+                  "reported by the crypto backend: %s",
+                  reason);
 #else
         serverLog(LL_WARNING,
                   "FATAL: hashing the requirepass password failed, the SHA-256 digest returned an "
                   "error. Refusing to start rather than run with a default user that nobody can "
-                  "authenticate as.");
+                  "authenticate as. Reason reported by the crypto backend: %s",
+                  reason);
 #endif
         exit(1);
     }
@@ -7555,6 +7560,8 @@ __attribute__((weak)) int main(int argc, char **argv) {
          * unusable here: server.logfile is still NULL and serverLogRaw() would
          * dereference it, crashing with no diagnostic at all. Report on stderr
          * and refuse to start. */
+        char reason[256];
+        getCryptoFailureReason(reason, sizeof(reason));
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
         fprintf(stderr, "FATAL: the CSPRNG failed to supply the hash table seed.\n"
                         "Check the crypto provider selected in openssl.cnf and its DRBG: a provider "
@@ -7569,6 +7576,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
                         "Refusing to start rather than derive the hash seed from the clock/pid "
                         "fallback.\n");
 #endif
+        fprintf(stderr, "Reason reported by the crypto backend: %s\n", reason);
         fflush(stderr);
         exit(1);
     }
@@ -7734,8 +7742,13 @@ __attribute__((weak)) int main(int argc, char **argv) {
     if (server.hash_seed) {
         uint8_t seed[16] = {0};
         if (!getHashSeedFromString(seed, sizeof(seed), server.hash_seed, sdslen(server.hash_seed))) {
-            serverLog(LL_WARNING, "Failed to derive the configured hash seed: the SHA-256 digest returned "
-                                  "an error. Check the crypto provider selected in openssl.cnf. Exiting.");
+            char reason[256];
+            getCryptoFailureReason(reason, sizeof(reason));
+            serverLog(LL_WARNING,
+                      "Failed to derive the configured hash seed: the SHA-256 digest returned an error. "
+                      "Check the crypto provider selected in openssl.cnf. Reason reported by the crypto "
+                      "backend: %s. Exiting.",
+                      reason);
             exit(1);
         }
         setConfigurableHashSeed(seed);
@@ -7839,10 +7852,21 @@ __attribute__((weak)) int main(int argc, char **argv) {
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
         0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
     unsigned char sha256_selftest[SHA256_BLOCK_SIZE];
-    if (!digestSHA256(sha256_selftest, "abc", 3) || memcmp(sha256_selftest, sha256_abc, SHA256_BLOCK_SIZE) != 0) {
-        serverLog(LL_WARNING, "The SHA-256 implementation reachable through the crypto provider selected in "
-                              "openssl.cnf is missing or returns the wrong digest. ACL password hashing and "
-                              "AUTH would fail for every client. Exiting.");
+    /* Keep the two outcomes apart in the message: the reason the crypto backend
+     * reports belongs to a call that failed, so it says nothing about a call
+     * that succeeded and returned the wrong bytes. */
+    int digest_ok = digestSHA256(sha256_selftest, "abc", 3);
+    if (!digest_ok || memcmp(sha256_selftest, sha256_abc, SHA256_BLOCK_SIZE) != 0) {
+        char reason[256];
+        getCryptoFailureReason(reason, sizeof(reason));
+        serverLog(LL_WARNING,
+                  "The SHA-256 implementation reachable through the crypto provider selected in openssl.cnf "
+                  "%s. ACL password hashing and AUTH would fail for every client. Reason reported by the "
+                  "crypto backend: %s. Exiting.",
+                  digest_ok ? "returned the wrong digest, so the reason below belongs to no failed call and "
+                              "may be unrelated"
+                            : "failed",
+                  reason);
         exit(1);
     }
     serverLog(LL_NOTICE, "Provider-backed crypto enabled: ACL password hashing and secret random material "

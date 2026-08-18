@@ -59,6 +59,7 @@
 /* USE_OPENSSL_PROVIDER_CRYPTO is derived in config.h; see the comment there for
  * exactly which builds get provider-backed crypto and why. */
 #ifdef USE_OPENSSL_PROVIDER_CRYPTO
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #endif
@@ -1078,9 +1079,22 @@ err:
 static EVP_MD *sha256_md = NULL;
 static pthread_once_t sha256_md_once = PTHREAD_ONCE_INIT;
 
+/* Why the fetch failure is recorded instead of read from the error queue when
+ * it is reported: the fetch is one-shot, so by the time the first AUTH fails
+ * the queue entry is long gone, and it may have been queued on another thread
+ * entirely. This buffer is written only inside pthread_once(), so there is
+ * exactly one writer ever, and pthread_once() gives the happens-before edge for
+ * every later reader. Empty means no fetch failure was recorded. */
+static char sha256_fetch_error[256];
+
 static void fetchSHA256MD(void) {
     EVP_MD *md = EVP_MD_fetch(NULL, "SHA256", NULL);
-    if (md == NULL) return;
+    if (md == NULL) {
+        unsigned long e, last = 0;
+        while ((e = ERR_get_error()) != 0) last = e;
+        if (last != 0) ERR_error_string_n(last, sha256_fetch_error, sizeof(sha256_fetch_error));
+        return;
+    }
 
     /* Validate the output size here, not after a digest has run: callers give
      * digestSHA256() a SHA256_BLOCK_SIZE byte buffer and EVP_Digest() writes
@@ -1089,6 +1103,9 @@ static void fetchSHA256MD(void) {
      * returns an int and may be negative, so anything but an exact match is a
      * failure and leaves sha256_md NULL: every digest then fails closed. */
     if (EVP_MD_get_size(md) != SHA256_BLOCK_SIZE) {
+        /* Nothing was queued here, so the reason is self authored. */
+        snprintf(sha256_fetch_error, sizeof(sha256_fetch_error),
+                 "the provider supplied a SHA-256 of %d bytes, expected %d", EVP_MD_get_size(md), SHA256_BLOCK_SIZE);
         EVP_MD_free(md);
         return;
     }
@@ -1189,6 +1206,10 @@ static int seed_initialized = 0;
  * secret material derived from it. */
 static int seed_from_urandom = 0;
 static unsigned char seed[64]; /* 512 bit internal block size. */
+/* errno of the failing /dev/urandom open or read in initializeRandomSeed(), 0
+ * when no read was attempted or the last one succeeded. Part of the
+ * random_mutex protected state. */
+static int random_seed_errno = 0;
 /* Counter-mode counter hashed with the seed by getRandomBytes(). Part of the
  * mutex-protected generator state, at file scope so the atfork child handler
  * can restart it after re-keying. */
@@ -1292,6 +1313,10 @@ static void initializeRandomSeed(void) {
      * cryptographic security needs. */
     FILE *fp = fopen("/dev/urandom", "r");
     if (fp == NULL || fread(seed, sizeof(seed), 1, fp) != 1) {
+        /* Record why, as the first statement of this branch: the derivation
+         * loop below calls gettimeofday() and getpid() and the fclose() that
+         * follows may all clobber errno. getCryptoFailureReason() reports it. */
+        random_seed_errno = errno;
         /* Revert to a weaker seed, and in this case reseed again
          * at every call.*/
         for (unsigned int j = 0; j < sizeof(seed); j++) {
@@ -1301,6 +1326,7 @@ static void initializeRandomSeed(void) {
             seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (long)fp;
         }
     } else {
+        random_seed_errno = 0;
         seed_initialized = 1;
         seed_from_urandom = 1;
     }
@@ -1452,6 +1478,53 @@ int getSecureRandomHexChars(char *p, size_t len) {
     if (!getSecureRandomBytes((unsigned char *)p, len)) return 0;
     for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
     return 1;
+}
+
+/* Write a NUL terminated, never empty, human readable reason for the most
+ * recent crypto failure seen on this thread into `buf`, which must be at least
+ * 256 bytes (the minimum ERR_error_string_n() asks for). When nothing was
+ * recorded a fixed "no further detail available" text is written, so the caller
+ * can always print the result unconditionally.
+ *
+ * For fail-closed diagnostics only, never on a success path: the call drains
+ * the OpenSSL error queue, and in the bundled build it takes random_mutex.
+ *
+ * The reason is the one machine supplied part of a fail-closed diagnostic: the
+ * OpenSSL error queue in provider builds, the /dev/urandom errno in the
+ * bundled build. Everything else those diagnostics print is hand written prose
+ * that names a category rather than the failure. */
+void getCryptoFailureReason(char *buf, size_t buflen) {
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    unsigned long e, last = 0;
+
+    /* Drain the whole queue and format the LAST entry, not the first: entries
+     * come out oldest first and the queue can still hold unrelated leftovers
+     * from earlier calls, so the newest one is the entry belonging to the call
+     * that just failed. Draining also means the next failure cannot be
+     * reported with a stale reason left behind by this one. */
+    while ((e = ERR_get_error()) != 0) last = e;
+    if (last != 0) {
+        ERR_error_string_n(last, buf, buflen);
+        return;
+    }
+    /* No queue entry: the failure may be the one-shot EVP_MD fetch, whose entry
+     * was consumed long before the first digest failed. */
+    if (sha256_md == NULL && sha256_fetch_error[0] != '\0') {
+        valkey_strlcpy(buf, sha256_fetch_error, buflen);
+        return;
+    }
+#else
+    int failed;
+
+    pthread_mutex_lock(&random_mutex);
+    failed = random_seed_errno;
+    pthread_mutex_unlock(&random_mutex);
+    if (failed != 0) {
+        snprintf(buf, buflen, "/dev/urandom could not be read: %s", strerror(failed));
+        return;
+    }
+#endif
+    valkey_strlcpy(buf, "no further detail available", buflen);
 }
 
 /* Given the filename, return the absolute path as an SDS string, or NULL
