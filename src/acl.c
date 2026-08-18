@@ -1547,6 +1547,43 @@ const char *ACLSetUserStringError(void) {
     return errmsg;
 }
 
+/* Hints appended to the log line written by ACLLogCryptoFailure(), naming what
+ * the operator has to look at for a digest failure and for a CSPRNG failure. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+#define ACL_CRYPTO_HINT_DIGEST                                                    \
+    "Check the crypto provider selected in openssl.cnf: a provider that fails a " \
+    "self test makes every subsequent digest fail."
+#define ACL_CRYPTO_HINT_RANDOM                                                    \
+    "Check the crypto provider selected in openssl.cnf and its DRBG: a provider " \
+    "that fails a self test, or that supplies no DRBG, makes every subsequent "   \
+    "random byte request fail."
+#else
+#define ACL_CRYPTO_HINT_DIGEST "The SHA-256 digest returned an error."
+#define ACL_CRYPTO_HINT_RANDOM                                                    \
+    "The random bytes could not be read from /dev/urandom: check that it exists " \
+    "and is readable by this process."
+#endif
+
+/* Report a crypto backend failure to the server log, so that an operator has
+ * something to grep for when a provider or DRBG stops working on a running
+ * server. 'context' names the operation that failed and 'hint' is one of the
+ * ACL_CRYPTO_HINT_* strings above.
+ *
+ * The rate limit is not cosmetic: AUTH is reachable before authentication, so
+ * without it an unauthenticated peer could make the server write one log line
+ * per request and fill the disk. At most one line per second is emitted.
+ *
+ * Nothing untrusted or secret may be passed in here: no password, no password
+ * hash and no client supplied user name. */
+static void ACLLogCryptoFailure(const char *context, const char *hint) {
+    static mstime_t last_log = 0;
+    mstime_t now = mstime();
+
+    if (last_log != 0 && now - last_log < 1000) return;
+    last_log = now;
+    serverLog(LL_WARNING, "%s failed. %s", context, hint);
+}
+
 /* Create the default user, this has special permissions. */
 static user *ACLCreateDefaultUser(void) {
     user *new = ACLCreateUser("default", 7);
@@ -1655,6 +1692,7 @@ static int checkPasswordBasedAuth(client *c, robj *username, robj *password, rob
         result = AUTH_OK;
     } else if (errno == EIO) {
         const char *msg = "-ERR hashing the password failed, check the crypto provider selected in openssl.cnf";
+        ACLLogCryptoFailure("Hashing the password supplied to AUTH", ACL_CRYPTO_HINT_DIGEST);
         *err = createStringObject(msg, strlen(msg));
         /* Skips the module authentication event for the same reason the ACL log
          * entry is skipped below: no authentication decision was made. */
@@ -2375,6 +2413,9 @@ sds ACLStringSetUser(user *u, sds username, sds *argv, int argc) {
     for (int j = 0; j < merged_argc; j++) {
         if (ACLSetUser(tempu, acl_args[j], (ssize_t)sdslen(acl_args[j])) != C_OK) {
             const char *errmsg = ACLSetUserStringError();
+            /* Only a crypto backend failure is worth a log line: every other
+             * errno is a syntax error of the caller, already reported back. */
+            if (errno == EIO) ACLLogCryptoFailure("Hashing a password for ACL SETUSER", ACL_CRYPTO_HINT_DIGEST);
             error = sdscatfmt(sdsempty(), "Error in ACL SETUSER modifier '%s': %s", (char *)acl_args[j], errmsg);
             goto cleanup;
         }
@@ -2448,6 +2489,9 @@ int ACLAppendUserForLoading(sds *argv, int argc, int *argc_err) {
 
     for (int j = 0; j < merged_argc; j++) {
         if (ACLSetUser(fakeuser, acl_args[j], sdslen(acl_args[j])) == C_ERR) {
+            if (errno == EIO)
+                ACLLogCryptoFailure("Hashing a password for a user directive in the configuration file",
+                                    ACL_CRYPTO_HINT_DIGEST);
             if (errno != ENOENT) {
                 ACLFreeUser(fakeuser);
                 if (argc_err) *argc_err = j;
@@ -2498,6 +2542,9 @@ static int ACLLoadConfiguredUsers(void) {
         for (int j = 1; aclrules[j]; j++) {
             if (ACLSetUser(u, aclrules[j], sdslen(aclrules[j])) != C_OK) {
                 const char *errmsg = ACLSetUserStringError();
+                if (errno == EIO)
+                    ACLLogCryptoFailure("Hashing a password for a user directive in the configuration file",
+                                        ACL_CRYPTO_HINT_DIGEST);
                 serverLog(LL_WARNING,
                           "Error loading ACL rule '%s' for "
                           "the user named '%s': %s",
@@ -2636,6 +2683,7 @@ static sds ACLLoadFromFile(const char *filename) {
             acl_args[j] = sdstrim(acl_args[j], "\t\r\n");
             if (ACLSetUser(u, acl_args[j], sdslen(acl_args[j])) != C_OK) {
                 const char *errmsg = ACLSetUserStringError();
+                if (errno == EIO) ACLLogCryptoFailure("Hashing a password for a rule in the ACL file", ACL_CRYPTO_HINT_DIGEST);
                 if (errno == ENOENT) {
                     /* For missing commands, we print out more information since
                      * it shouldn't contain any sensitive information. */
@@ -3334,6 +3382,7 @@ void aclCommand(client *c) {
 
         long chars = (bits + 3) / 4; /* Round to number of characters to emit. */
         if (!getSecureRandomHexChars(pass, chars)) {
+            ACLLogCryptoFailure("Generating a password for ACL GENPASS", ACL_CRYPTO_HINT_RANDOM);
             /* Fail closed: never emit a password from a weaker generator. This
              * must stay an error reply, not a panic: GENPASS is a client
              * command and a provider failure must not take the server down. */
