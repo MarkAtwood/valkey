@@ -1572,6 +1572,8 @@ const char *ACLSetUserStringError(void) {
  * The rate limit is not cosmetic: AUTH is reachable before authentication, so
  * without it an unauthenticated peer could make the server write one log line
  * per request and fill the disk. At most one line per second is emitted.
+ * mstime() counts from the epoch, not from server start, so the first call
+ * always clears the limit and no separate first-call test is needed.
  *
  * Nothing untrusted or secret may be passed in here: no password, no password
  * hash and no client supplied user name.
@@ -1593,7 +1595,7 @@ static void ACLLogCryptoFailure(const char *context, const char *hint) {
      * failure cannot be reported with the stale reason of a suppressed one. */
     getCryptoFailureReason(reason, sizeof(reason));
 
-    if (last_log == 0 || now - last_log >= 1000) {
+    if (now - last_log >= 1000) {
         last_log = now;
         serverLog(LL_WARNING, "%s failed. %s %s", context, hint, reason);
     }
