@@ -680,6 +680,83 @@ int test_keyslot(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     return ValkeyModule_ReplyWithLongLong(ctx, slot);
 }
 
+/* Longest draw the two test.securerandom* commands accept. Bounds the
+ * allocation a client can ask the test module to make. */
+#define SECURE_RANDOM_MAX_LEN 4096
+
+/* Parse the <len> argument shared by the test.securerandom* commands. Replies
+ * with an error and returns 0 if it is not a usable length. */
+static int secure_random_parse_len(ValkeyModuleCtx *ctx, ValkeyModuleString *arg, size_t *out) {
+    long long len;
+    if (ValkeyModule_StringToLongLong(arg, &len) != VALKEYMODULE_OK || len < 1 || len > SECURE_RANDOM_MAX_LEN) {
+        ValkeyModule_ReplyWithError(ctx, "ERR invalid length");
+        return 0;
+    }
+    *out = (size_t)len;
+    return 1;
+}
+
+/* test.securerandomhex <len> -- draw len hex chars through the module API.
+ * The buffer is prefilled with '#', which is outside the [0-9a-f] contract, so
+ * the caller can tell an unwritten position from a drawn one; a canary at
+ * index len catches an over-write. */
+int test_secure_random_hex(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+
+    size_t len;
+    if (!secure_random_parse_len(ctx, argv[1], &len)) return VALKEYMODULE_OK;
+
+    char *buf = ValkeyModule_Alloc(len + 1);
+    memset(buf, '#', len + 1);
+
+    if (ValkeyModule_GetSecureRandomHexChars(buf, len) != VALKEYMODULE_OK) {
+        ValkeyModule_Free(buf);
+        return ValkeyModule_ReplyWithError(ctx, "ERR GetSecureRandomHexChars failed");
+    }
+    if (buf[len] != '#') {
+        ValkeyModule_Free(buf);
+        return ValkeyModule_ReplyWithError(ctx, "ERR GetSecureRandomHexChars wrote past len");
+    }
+
+    ValkeyModule_ReplyWithStringBuffer(ctx, buf, len);
+    ValkeyModule_Free(buf);
+    return VALKEYMODULE_OK;
+}
+
+/* test.securerandombytes <len> -- draw len raw bytes through the module API and
+ * reply with their hex encoding, so the TCL side can compare them. Same canary
+ * scheme as test.securerandomhex, with 0xA5 as the fill. */
+int test_secure_random_bytes(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) return ValkeyModule_WrongArity(ctx);
+
+    size_t len;
+    if (!secure_random_parse_len(ctx, argv[1], &len)) return VALKEYMODULE_OK;
+
+    unsigned char *buf = ValkeyModule_Alloc(len + 1);
+    memset(buf, 0xA5, len + 1);
+
+    if (ValkeyModule_GetSecureRandomBytes(buf, len) != VALKEYMODULE_OK) {
+        ValkeyModule_Free(buf);
+        return ValkeyModule_ReplyWithError(ctx, "ERR GetSecureRandomBytes failed");
+    }
+    if (buf[len] != 0xA5) {
+        ValkeyModule_Free(buf);
+        return ValkeyModule_ReplyWithError(ctx, "ERR GetSecureRandomBytes wrote past len");
+    }
+
+    static const char hexdigits[] = "0123456789abcdef";
+    char *hex = ValkeyModule_Alloc(len * 2);
+    for (size_t i = 0; i < len; i++) {
+        hex[i * 2] = hexdigits[buf[i] >> 4];
+        hex[i * 2 + 1] = hexdigits[buf[i] & 0xf];
+    }
+
+    ValkeyModule_ReplyWithStringBuffer(ctx, hex, len * 2);
+    ValkeyModule_Free(hex);
+    ValkeyModule_Free(buf);
+    return VALKEYMODULE_OK;
+}
+
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -756,6 +833,10 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_CreateCommand(ctx, "test.malloc_api", test_malloc_api,"", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "test.keyslot", test_keyslot, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "test.securerandomhex", test_secure_random_hex, "", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "test.securerandombytes", test_secure_random_bytes, "", 0, 0, 0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
     return VALKEYMODULE_OK;

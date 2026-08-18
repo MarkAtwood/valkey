@@ -594,6 +594,50 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
     test "Cluster keyslot" {
         assert_equal 12182 [r test.keyslot foo]
     }
+
+    # test.securerandomhex/test.securerandombytes reply with an error if the
+    # module API returns non-OK or if it wrote past the requested length, so
+    # reaching the assertions below already proves both of those.
+    test "Secure random hex chars length and charset" {
+        foreach len {1 2 33 64 65 128} {
+            set s [r test.securerandomhex $len]
+            assert_equal $len [string length $s]
+            assert {[regexp {^[0-9a-f]+$} $s]}
+        }
+        assert {[r test.securerandomhex 64] ne [r test.securerandomhex 64]}
+    }
+
+    test "Secure random bytes length" {
+        foreach len {1 2 33 64 65 128} {
+            # The reply is the hex encoding of len raw bytes.
+            set s [r test.securerandombytes $len]
+            assert_equal [expr {$len * 2}] [string length $s]
+            assert {[regexp {^[0-9a-f]+$} $s]}
+        }
+        assert {[r test.securerandombytes 64] ne [r test.securerandombytes 64]}
+    }
+
+    test "Secure random draws vary at every position" {
+        # A generator that fills only a prefix leaves the tail constant across
+        # draws, which a length or charset check cannot see. Every position of
+        # a real draw takes more than one value over 16 draws unless the
+        # generator is stuck there; a false failure needs one position to land
+        # on the same hex digit 16 times, 16^-15.
+        foreach cmd {securerandomhex securerandombytes} {
+            set draws {}
+            for {set i 0} {$i < 16} {incr i} {
+                lappend draws [r test.$cmd 64]
+            }
+            set width [string length [lindex $draws 0]]
+            for {set pos 0} {$pos < $width} {incr pos} {
+                set seen {}
+                foreach draw $draws {
+                    lappend seen [string index $draw $pos]
+                }
+                assert_morethan [llength [lsort -unique $seen]] 1
+            }
+        }
+    }
 }
 
 start_server {tags {"modules"}} {

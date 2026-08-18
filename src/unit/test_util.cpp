@@ -347,3 +347,65 @@ TEST_F(UtilTest, TestWritePointerWithPadding) {
         ASSERT_EQ(buf[i], 0u);
     }
 }
+
+/* getSecureRandomHexChars() must emit only [0-9a-f] and must not write past
+ * len. The charset is the documented contract, so it is an oracle independent
+ * of whichever generator backs the call (provider RAND or the bundled one). */
+TEST_F(UtilTest, TestSecureRandomHexCharsCharset) {
+    char buf[128];
+    const size_t len = sizeof(buf) - 1;
+
+    memset(buf, '#', sizeof(buf)); /* '#' is outside the charset, so any byte
+                                    * left as '#' below was never written. */
+    ASSERT_EQ(getSecureRandomHexChars(buf, len), 1);
+
+    for (size_t i = 0; i < len; i++) {
+        ASSERT_TRUE((buf[i] >= '0' && buf[i] <= '9') || (buf[i] >= 'a' && buf[i] <= 'f'))
+            << "byte " << i << " is 0x" << std::hex << (int)(unsigned char)buf[i];
+    }
+    ASSERT_EQ(buf[len], '#');
+}
+
+/* Every byte position must be written, successive draws must differ, and
+ * nothing past len may be touched.
+ *
+ * The oracle is independent of the generator: the buffer is prefilled with a
+ * canary and drawn into kDraws times. If some position is never written it
+ * holds the canary in every draw; if it is written, it survives as the canary
+ * in all kDraws draws only with probability 2^-kDraws (2^-16 here). That
+ * catches a stub filling only a prefix, which the previous all-zeros/two-draws
+ * memcmp pair did not: memcmp returns at the first differing byte, so a
+ * generator writing just a[0] passed both of its assertions. */
+TEST_F(UtilTest, TestSecureRandomBytesFillsAndVaries) {
+    constexpr size_t kLen = 64;
+    constexpr int kDraws = 16;
+    constexpr unsigned char kCanary = 0xA5;
+
+    bool written[kLen];
+    memset(written, 0, sizeof(written));
+
+    unsigned char prev[kLen];
+    memset(prev, kCanary, sizeof(prev));
+
+    for (int draw = 0; draw < kDraws; draw++) {
+        unsigned char buf[kLen + 1];
+        memset(buf, kCanary, sizeof(buf));
+
+        ASSERT_EQ(getSecureRandomBytes(buf, kLen), 1) << "draw " << draw << " failed";
+        ASSERT_EQ(buf[kLen], kCanary) << "draw " << draw << " wrote past len";
+
+        for (size_t i = 0; i < kLen; i++) {
+            if (buf[i] != kCanary) written[i] = true;
+        }
+
+        /* Two consecutive identical 64-byte draws is a 2^-512 event. */
+        if (draw > 0) {
+            ASSERT_NE(memcmp(buf, prev, kLen), 0) << "draw " << draw << " repeats the previous draw";
+        }
+        memcpy(prev, buf, kLen);
+    }
+
+    for (size_t i = 0; i < kLen; i++) {
+        ASSERT_TRUE(written[i]) << "byte " << i << " was never written in " << kDraws << " draws";
+    }
+}
