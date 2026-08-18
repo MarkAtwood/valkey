@@ -1167,11 +1167,20 @@ int version2num(const char *version) {
  * seed, seed_from_urandom and the counter in getRandomBytes()). The cost is
  * that every thread drawing bytes contends on one lock; if that ever shows up
  * in a profile, the upgrade path is a per-thread generator state seeded from
- * the global one. What makes that global lock fork-safe is the pthread_atfork()
- * handler below: a forked child draws random bytes (the RDB EOF mark on the
- * diskless replication path), and without it a mutex held by another thread at
- * the instant of fork() would stay locked forever in the child, with no owner
- * left to release it. */
+ * the global one.
+ *
+ * The pthread_atfork() handlers below cover the two fork hazards of that global
+ * state. The prepare/parent pair keeps the lock fork-safe: a mutex held by
+ * another thread at the instant of fork() would otherwise stay locked forever
+ * in the child, with no owner left to release it. The child handler enforces
+ * the fork rule, which is that a forked child must not continue the parent's
+ * stream. The RDB child draws the EOF mark on the diskless replication path
+ * (see rdbSaveRioWithEOFMark()) and publishes it to every replica, and its
+ * draws do not advance the parent's counter, so an inherited seed and counter
+ * would leave the parent's next draw at a stream position whose output is
+ * already on the wire. Clearing the seed state in the child forces a fresh
+ * /dev/urandom seed on its first draw, which makes the two streams
+ * independent. */
 static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
 /* Set only when the 64 byte seed was actually read from /dev/urandom. The
@@ -1189,12 +1198,24 @@ static void randomAtforkUnlock(void) {
     pthread_mutex_unlock(&random_mutex);
 }
 
+/* Runs in the child after fork(). Dropping the inherited seed makes the next
+ * draw call initializeRandomSeed() again, so the child never continues the
+ * parent's stream. If /dev/urandom is unreadable there, seed_initialized stays
+ * clear (a weak seed is re-derived per call, which is fine for the non-secret
+ * values a child draws) and seed_from_urandom stays clear, so a secure draw in
+ * the child still fails closed. */
+static void randomAtforkChild(void) {
+    seed_initialized = 0;
+    seed_from_urandom = 0;
+    pthread_mutex_unlock(&random_mutex);
+}
+
 /* Registered exactly once, via random_atfork_once, by every entry point that
  * takes random_mutex, so registration always happens before the first fork(). */
 static pthread_once_t random_atfork_once = PTHREAD_ONCE_INIT;
 
 static void registerRandomAtfork(void) {
-    pthread_atfork(randomAtforkLock, randomAtforkUnlock, randomAtforkUnlock);
+    pthread_atfork(randomAtforkLock, randomAtforkUnlock, randomAtforkChild);
 }
 
 /* Call with random_mutex held, or before any other thread exists. */

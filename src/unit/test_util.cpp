@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstring>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern "C" {
@@ -427,4 +428,58 @@ TEST_F(UtilTest, TestSecureRandomBytesFillsAndVaries) {
     for (size_t i = 0; i < kLen; i++) {
         ASSERT_TRUE(written[i]) << "byte " << i << " was never written in " << kDraws << " draws";
     }
+}
+
+/* A forked child must not continue the parent's generator stream. The RDB child
+ * publishes its draw, the diskless replication EOF mark, on the replication
+ * link while the parent's stream position does not advance, so the two streams
+ * have to be independent. The oracle is that documented property rather than
+ * the implementation: parent and child draw the same number of bytes from what
+ * would be the same inherited position, and the results must differ. Two equal
+ * 40 character hex draws is a 2^-160 event.
+ *
+ * This exercises the always-bundled non-secure generator, so it is valid in
+ * provider and non-provider builds alike. */
+TEST_F(UtilTest, TestRandomStreamDivergesAcrossFork) {
+    constexpr size_t kLen = 40;
+
+    /* Draw in the parent first: this registers the atfork handlers and fixes
+     * the stream position the child would otherwise inherit and reuse. */
+    char warmup[kLen];
+    getRandomHexChars(warmup, sizeof(warmup));
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1);
+    if (pid == 0) {
+        /* No gtest assertions here: they are not valid in the child. */
+        char buf[kLen];
+        getRandomHexChars(buf, sizeof(buf));
+        ssize_t written = write(fds[1], buf, sizeof(buf));
+        _exit(written == (ssize_t)sizeof(buf) ? 0 : 1);
+    }
+    ASSERT_EQ(close(fds[1]), 0);
+
+    char parent_buf[kLen];
+    getRandomHexChars(parent_buf, sizeof(parent_buf));
+
+    char child_buf[kLen];
+    size_t got = 0;
+    while (got < sizeof(child_buf)) {
+        ssize_t n = read(fds[0], child_buf + got, sizeof(child_buf) - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    ASSERT_EQ(close(fds[0]), 0);
+
+    int status = 0;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_EQ(got, sizeof(child_buf));
+
+    ASSERT_NE(memcmp(parent_buf, child_buf, sizeof(parent_buf)), 0)
+        << "the forked child continued the parent's random stream";
 }
