@@ -7582,6 +7582,28 @@ __attribute__((weak)) int main(int argc, char **argv) {
     }
     hashtableSetHashFunctionSeed(hashseed);
 
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    /* The bundled counter-mode generator takes its seed from the same provider
+     * DRBG, and its output includes the diskless replication EOF mark, which
+     * must be unpredictable. Draw that seed here, before initServerConfig()
+     * takes the run id off the stream, so a DRBG failure is reported instead of
+     * silently degrading every value drawn for the rest of the run. In bundled
+     * builds the getSecureRandomBytes() gate above already runs exactly this
+     * code path, so a second check there would be redundant. */
+    if (!ensureRandomSeedInitialized()) {
+        char seed_reason[256];
+        getCryptoFailureReason(seed_reason, sizeof(seed_reason));
+        fprintf(stderr, "FATAL: the provider DRBG refused to seed the internal random generator.\n"
+                        "RAND_priv_bytes() failed while drawing the 64 byte seed behind the run id, the "
+                        "replication id, cluster node names and the diskless replication EOF mark, which "
+                        "must be unpredictable.\n"
+                        "Refusing to start rather than run that generator on a clock/pid seed.\n");
+        fprintf(stderr, "Reason reported by the crypto backend: %s\n", seed_reason);
+        fflush(stderr);
+        exit(1);
+    }
+#endif
+
     char *exec_name = strrchr(argv[0], '/');
     if (exec_name == NULL) exec_name = argv[0];
     server.sentinel_mode = checkForSentinelMode(argc, argv, exec_name);

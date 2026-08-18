@@ -1183,7 +1183,7 @@ int version2num(const char *version) {
 /* Global state of the bundled random generator.
  *
  * One global mutex serialises the whole bundled generator (seed_initialized,
- * seed, seed_from_urandom and the counter in getRandomBytes()). The cost is
+ * seed, seed_from_csprng and the counter in getRandomBytes()). The cost is
  * that every thread drawing bytes contends on one lock; if that ever shows up
  * in a profile, the upgrade path is a per-thread generator state seeded from
  * the global one.
@@ -1202,16 +1202,20 @@ int version2num(const char *version) {
  * draw. */
 static pthread_mutex_t random_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int seed_initialized = 0;
-/* Set only when the 64 byte seed was actually read from /dev/urandom. The
- * fallback derivation below is worth roughly the low bits of a microsecond
- * clock plus a partly known pid, so getSecureRandomBytes() refuses to hand out
- * secret material derived from it. */
-static int seed_from_urandom = 0;
+/* Set only when the 64 byte seed really came from a CSPRNG: the provider DRBG
+ * in provider builds, /dev/urandom in the others. The fallback derivation below
+ * is worth roughly the low bits of a microsecond clock plus a partly known pid,
+ * so getSecureRandomBytes() refuses to hand out secret material derived from
+ * it and main() refuses to start on it. */
+static int seed_from_csprng = 0;
 static unsigned char seed[64]; /* 512 bit internal block size. */
+#ifndef USE_OPENSSL_PROVIDER_CRYPTO
 /* errno of the failing /dev/urandom open or read in initializeRandomSeed(), 0
  * when no read was attempted or the last one succeeded. Part of the
- * random_mutex protected state. */
+ * random_mutex protected state. Bundled builds only: a provider build seeds
+ * from the DRBG, which reports through the OpenSSL error queue instead. */
 static int random_seed_errno = 0;
+#endif
 /* Counter-mode counter hashed with the seed by getRandomBytes(). Part of the
  * mutex-protected generator state, at file scope so the atfork child handler
  * can restart it after re-keying. */
@@ -1264,13 +1268,15 @@ static void randomHmacSha256(const unsigned char *key64, const unsigned char *ms
  * fresh seed from the seed it already holds, mixed with its pid and the time of
  * the fork, and restarts the counter. Dropping the inherited seed and forcing
  * initializeRandomSeed() to run again would instead make the child depend on
- * /dev/urandom still being readable there; when it is not (an fd-exhausted
- * process, a restricted /dev, a per-child seccomp filter) the seed would fall
- * back to the clock/pid derivation, which is worth a few tens of bits. The EOF
- * mark is not secret, but a guessable mark can be planted inside a value by any
- * client with write access, so a fork must never lower its strength. Re-keying
- * inherits whatever strength the parent's seed had, so seed_initialized and
- * seed_from_urandom carry over unchanged.
+ * the CSPRNG still being reachable there, meaning a working provider DRBG in a
+ * provider build and a readable /dev/urandom in the others; when it is not (an
+ * fd-exhausted process, a restricted /dev, a per-child seccomp filter, a
+ * provider that fails in the child) the seed would fall back to the clock/pid
+ * derivation, which is worth a few tens of bits. The EOF mark is not secret,
+ * but a guessable mark can be planted inside a value by any client with write
+ * access, so a fork must never lower its strength. Re-keying inherits whatever
+ * strength the parent's seed had, so seed_initialized and seed_from_csprng
+ * carry over unchanged.
  *
  * A child handler runs under the same restriction as a signal handler: after a
  * fork() in a multithreaded process only the POSIX async-signal-safe functions
@@ -1312,38 +1318,61 @@ static void registerRandomAtfork(void) {
     pthread_atfork(randomAtforkLock, randomAtforkUnlock, randomAtforkChild);
 }
 
+/* Weaker seed for when the CSPRNG could not be read: the low bits of a
+ * microsecond clock, a partly known pid, and whatever `mix` carries. Worth a
+ * few tens of bits, so the caller leaves seed_from_csprng clear, and the seed
+ * is derived again at every call because seed_initialized stays clear too. */
+static void deriveWeakRandomSeed(long mix) {
+    for (unsigned int j = 0; j < sizeof(seed); j++) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        pid_t pid = getpid();
+        seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ mix;
+    }
+}
+
 /* Call with random_mutex held, or before any other thread exists. */
 static void initializeRandomSeed(void) {
     assert(seed_initialized == 0);
     /* Initialize a seed and use HMAC-SHA256 in counter mode, where we hash
-     * the same seed with a progressive counter. For the goals of this
-     * function we just need non-colliding strings, there are no
-     * cryptographic security needs. */
+     * the same seed with a progressive counter. Most of what this generator
+     * feeds just needs non-colliding strings, but the diskless replication EOF
+     * mark drawn off the same stream must be unpredictable, so the seed itself
+     * comes from a CSPRNG. */
+#ifdef USE_OPENSSL_PROVIDER_CRYPTO
+    /* Seed from the provider the operator selected rather than /dev/urandom, so
+     * the whole generator stays inside that provider and a provider build has
+     * no /dev/urandom dependency at all. The private DRBG is the right one
+     * here: the seed itself is never published, only values derived from it. */
+    if (RAND_priv_bytes(seed, (int)sizeof(seed)) == 1) {
+        seed_initialized = 1;
+        seed_from_csprng = 1;
+        return;
+    }
+    /* The DRBG refused. It leaves the reason on the OpenSSL error queue, where
+     * getCryptoFailureReason() picks it up; main() reports it and exits rather
+     * than let the server run on the derivation below. */
+    deriveWeakRandomSeed(0);
+#else
     FILE *fp = fopen("/dev/urandom", "r");
     if (fp == NULL || fread(seed, sizeof(seed), 1, fp) != 1) {
         /* Record why, as the first statement of this branch: the derivation
-         * loop below calls gettimeofday() and getpid() and the fclose() that
+         * below calls gettimeofday() and getpid() and the fclose() that
          * follows may all clobber errno. getCryptoFailureReason() reports it. */
         random_seed_errno = errno;
-        /* Revert to a weaker seed, and in this case reseed again
-         * at every call.*/
-        for (unsigned int j = 0; j < sizeof(seed); j++) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            pid_t pid = getpid();
-            seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (long)fp;
-        }
+        deriveWeakRandomSeed((long)fp);
     } else {
         random_seed_errno = 0;
         seed_initialized = 1;
-        seed_from_urandom = 1;
+        seed_from_csprng = 1;
     }
     if (fp) fclose(fp);
+#endif
 }
 
 /* This function receives a string with 64 bytes encoded as 128 hexadecimal
  * digits, and sets the 64 byte random seed. It exists so that `make test-unit
- * seed=<n>` reproduces a run, so it clears seed_from_urandom: a caller-supplied
+ * seed=<n>` reproduces a run, so it clears seed_from_csprng: a caller-supplied
  * seed is reproducible, hence not usable for secret material, and clearing the
  * flag here makes getSecureRandomBytes() fail closed whatever seeded the
  * generator earlier. Nothing in the server calls it. */
@@ -1356,7 +1385,7 @@ void setRandomSeedCString(char *seed_str, size_t len) {
         sscanf(seed_str + (i * 2), "%02hhX", &seed[i]);
     }
     seed_initialized = 1;
-    seed_from_urandom = 0;
+    seed_from_csprng = 0;
     pthread_mutex_unlock(&random_mutex);
 }
 
@@ -1378,9 +1407,10 @@ void getRandomSeedCString(char *buff, size_t len) {
     buff[sizeof(seed) * 2] = '\0';
 }
 
-/* Get random bytes, attempts to get an initial seed from /dev/urandom and
- * the uses HMAC-SHA256 in counter mode to generate a random
- * stream. However if /dev/urandom is not available, a weaker seed is used.
+/* Get random bytes: HMAC-SHA256 in counter mode over a 64 byte seed drawn from
+ * a CSPRNG, which is the provider DRBG in a provider build and /dev/urandom in
+ * the others. If that draw fails a weaker seed is used, and the server refuses
+ * to start on it (see main() in server.c).
  *
  * The generator state (seed and counter) is global and is serialised with
  * random_mutex, so concurrent callers get distinct output.
@@ -1394,14 +1424,14 @@ void getRandomSeedCString(char *buff, size_t len) {
  * The RDB EOF mark is the exception on this path and must be unpredictable
  * until it is sent: a mark a client can guess can be planted inside a value by
  * anyone with write access, truncating the diskless replication stream at the
- * planted copy. The counter mode stream over the /dev/urandom seed supplies
- * that, and randomAtforkChild() preserves it across the fork that draws the
- * mark by re-keying rather than reseeding.
+ * planted copy. The counter mode stream over the CSPRNG seed supplies that,
+ * and randomAtforkChild() preserves it across the fork that draws the mark by
+ * re-keying rather than reseeding.
  *
  * Secret material must use getSecureRandomBytes() below, which is itself the
  * one caller here that draws secrets: in builds without provider crypto it
  * falls back to this generator, and gates that fallback on the seed having come
- * from /dev/urandom. */
+ * from the CSPRNG. */
 void getRandomBytes(unsigned char *p, size_t len) {
     pthread_once(&random_atfork_once, registerRandomAtfork);
     pthread_mutex_lock(&random_mutex);
@@ -1440,6 +1470,22 @@ void getRandomHexChars(char *p, size_t len) {
     for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
 }
 
+/* Seed the bundled generator now, if it is not seeded yet, and report whether
+ * that seed came from the CSPRNG. Returns 1 when it did and 0 when the draw
+ * failed and the weak clock/pid derivation is in place instead.
+ *
+ * It exists so a caller can check the seed before anything has drawn from the
+ * stream: main() calls it at startup, ahead of the run id, the replication id
+ * and the diskless replication EOF mark, and refuses to start on a 0. */
+int ensureRandomSeedInitialized(void) {
+    pthread_once(&random_atfork_once, registerRandomAtfork);
+    pthread_mutex_lock(&random_mutex);
+    if (!seed_initialized) initializeRandomSeed();
+    int usable = seed_from_csprng;
+    pthread_mutex_unlock(&random_mutex);
+    return usable;
+}
+
 /* Get random bytes for secret material: the ACL GENPASS output, the hash
  * function seed and ValkeyModule_GetSecureRandomBytes(), which module code may
  * call for anything it treats as secret. Returns 1 on success and 0 on failure;
@@ -1453,13 +1499,13 @@ void getRandomHexChars(char *p, size_t len) {
  *
  * Other builds fall back to the bundled getRandomBytes(), which is a SHA-256
  * counter mode stream over a 64 byte seed. That is only as good as the seed, so
- * the fallback is refused unless the seed really came from /dev/urandom: when
- * the open or read fails (an fd-exhausted process, a container with a
- * restricted /dev, a seccomp filter), the seed degrades to the low bits of a
- * microsecond clock and the pid, which is worth a few tens of bits, not the 512
- * the buffer implies. Returning 0 there is the fail-closed answer; the caller
- * reports the failure. Off the provider path there is no provider or FIPS
- * guarantee of any kind.
+ * the fallback is refused unless the seed really came from the CSPRNG, which in
+ * those builds means /dev/urandom: when the open or read fails (an fd-exhausted
+ * process, a container with a restricted /dev, a seccomp filter), the seed
+ * degrades to the low bits of a microsecond clock and the pid, which is worth a
+ * few tens of bits, not the 512 the buffer implies. Returning 0 there is the
+ * fail-closed answer; the caller reports the failure. Off the provider path
+ * there is no provider or FIPS guarantee of any kind.
  *
  * A failure is never papered over by falling back to a weaker generator. */
 int getSecureRandomBytes(unsigned char *p, size_t len) {
@@ -1472,13 +1518,7 @@ int getSecureRandomBytes(unsigned char *p, size_t len) {
     }
     return 1;
 #else
-    pthread_once(&random_atfork_once, registerRandomAtfork);
-    pthread_mutex_lock(&random_mutex);
-    if (!seed_initialized) initializeRandomSeed();
-    int usable = seed_from_urandom;
-    pthread_mutex_unlock(&random_mutex);
-
-    if (!usable) return 0;
+    if (!ensureRandomSeedInitialized()) return 0;
     getRandomBytes(p, len);
     return 1;
 #endif
@@ -1508,7 +1548,8 @@ int getSecureRandomHexChars(char *p, size_t len) {
  * the OpenSSL error queue, and in the bundled build it takes random_mutex.
  *
  * The reason is the one machine supplied part of a fail-closed diagnostic: the
- * OpenSSL error queue in provider builds, the /dev/urandom errno in the
+ * OpenSSL error queue in provider builds, where both a RAND_priv_bytes() and an
+ * EVP_MD_fetch() failure leave their entry, and the /dev/urandom errno in the
  * bundled build. Everything else those diagnostics print is hand written prose
  * that names a category rather than the failure. */
 void getCryptoFailureReason(char *buf, size_t buflen) {

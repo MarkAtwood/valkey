@@ -1538,9 +1538,12 @@ int rdbSaveRioWithEOFMark(int req, int rdbver, rio *rdb, int *error, rdbSaveInfo
     /* The mark is published on the replication link, but only once the prefix
      * is written: until then it must be unpredictable, because a client that
      * can guess it can plant a copy inside a value and truncate this stream at
-     * the planted copy. When this runs in the diskless child it is drawn after
-     * the child's post-fork re-key (see the atfork handlers in util.c), so it
-     * is not a position of the parent's stream either. */
+     * the planted copy. The unpredictability comes from the counter mode stream
+     * over the CSPRNG seed in util.c, which is the provider DRBG in a provider
+     * build and /dev/urandom in the others, and which the server refuses to
+     * start without. When this runs in the diskless child the mark is drawn
+     * after the child's post-fork re-key (see the atfork handlers in util.c),
+     * so it is not a position of the parent's stream either. */
     getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
     if (error) *error = 0;
     if (rioWrite(rdb, "$EOF:", 5) == 0) goto werr;

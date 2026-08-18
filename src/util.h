@@ -119,6 +119,7 @@ void getRandomSeedCString(char *buff, size_t len);
 void setRandomSeedCString(char *seed_str, size_t len);
 void getRandomHexChars(char *p, size_t len);
 void getRandomBytes(unsigned char *p, size_t len);
+int ensureRandomSeedInitialized(void);
 int getSecureRandomHexChars(char *p, size_t len);
 int getSecureRandomBytes(unsigned char *p, size_t len);
 int digestSHA256(unsigned char *digest, const void *data, size_t len);
